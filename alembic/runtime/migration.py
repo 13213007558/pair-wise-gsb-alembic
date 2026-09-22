@@ -23,6 +23,7 @@ from sqlalchemy.engine import url as sqla_url
 from sqlalchemy.engine.strategies import MockEngineStrategy
 from typing_extensions import ContextManager
 
+from . import integrity as revision_integrity
 from .. import ddl
 from .. import util
 from ..util import sqla_compat
@@ -161,6 +162,10 @@ class MigrationContext:
         self.as_sql = as_sql
 
         self.purge = opts.get("purge", False)
+
+        self._verify_revision_digests = opts.get(
+            "verify_revision_digests", False
+        )
 
         if "output_encoding" in opts:
             self.output_buffer = EncodedIO(
@@ -584,11 +589,15 @@ class MigrationContext:
         """
         self.impl.start_migrations()
 
+        digest_store = self._get_digest_store()
+
         heads: tuple[str, ...]
         if self.purge:
             if self.as_sql:
                 raise util.CommandError("Can't use --purge with --sql mode")
             self._ensure_version_table(purge=True)
+            if digest_store is not None:
+                digest_store.purge()
             heads = ()
         else:
             heads = self.get_current_heads()
@@ -597,6 +606,13 @@ class MigrationContext:
 
             if not self.as_sql and not heads and not dont_mutate:
                 self._ensure_version_table()
+
+        if digest_store is not None:
+            # verify the executed history before any migration
+            # function is invoked
+            self.verify_revision_digests()
+            if not self.opts.get("dont_mutate", False):
+                digest_store.ensure_table()
 
         head_maintainer = HeadMaintainer(self, heads)
 
@@ -621,6 +637,11 @@ class MigrationContext:
                 # and row-targeted updates and deletes, it's simpler for now
                 # just to run the operations on every version
                 head_maintainer.update_to_step(step)
+                if digest_store is not None and isinstance(step, RevisionStep):
+                    # the migration function has succeeded at this point;
+                    # record the applied revision's digest, or for a
+                    # downgrade remove the reverted revision's record
+                    digest_store.record_step(step)
                 for callback in self.on_version_apply_callbacks:
                     callback(
                         ctx=self,
@@ -634,6 +655,58 @@ class MigrationContext:
         # the version table (e.g. ``downgrade base`` only deletes its row),
         # so dropping it in offline mode only was an inconsistency present
         # since the version table was first introduced.  See #1822.
+
+    def _get_digest_store(
+        self,
+    ) -> revision_integrity.RevisionDigestStore | None:
+        if self._verify_revision_digests and not self.as_sql:
+            return revision_integrity.RevisionDigestStore(self)
+        else:
+            return None
+
+    def verify_revision_digests(self) -> None:
+        """Verify recorded revision digests against the migration
+        files currently on disk.
+
+        The full executed revision closure implied by the current
+        database heads is checked against the digests recorded when
+        each revision was applied.  Raises
+        :class:`.RevisionIntegrityError` if any executed revision has
+        no recorded digest, if recorded revisions are no longer part of
+        the executed history, or if any migration file (or its revision
+        graph declarations) changed since it was applied.  Recorded
+        digests are never modified by this method.
+
+        """
+        if self.script is None:
+            raise util.CommandError(
+                "Can't verify revision digests without a "
+                "ScriptDirectory; pass the 'script' option when "
+                "configuring this MigrationContext"
+            )
+        revision_integrity.verify_executed_history(self, self.script)
+
+    def adopt_revision_digests(self) -> set[Script]:
+        """Record digests for the database's current executed
+        revision closure.
+
+        This is the explicit first-time adoption entry point for
+        databases that were migrated before digest verification was
+        enabled.  Adoption is refused, recording nothing, if any
+        revision or migration file is missing or if the revision graph
+        is incomplete.
+
+        Returns the set of revision scripts for which digests were
+        recorded.
+
+        """
+        if self.script is None:
+            raise util.CommandError(
+                "Can't adopt revision digests without a "
+                "ScriptDirectory; pass the 'script' option when "
+                "configuring this MigrationContext"
+            )
+        return revision_integrity.adopt_executed_history(self, self.script)
 
     def _in_connection_transaction(self) -> bool:
         try:

@@ -443,6 +443,13 @@ def merge(
     )
 
 
+def _verify_digests_environment_opt(config: Config) -> dict[str, bool]:
+    if util.asbool(config.get_alembic_option("verify_revision_digests")):
+        return {"verify_revision_digests": True}
+    else:
+        return {}
+
+
 def upgrade(
     config: Config,
     revision: str,
@@ -483,6 +490,7 @@ def upgrade(
         starting_rev=starting_rev,
         destination_rev=revision,
         tag=tag,
+        **_verify_digests_environment_opt(config),
     ):
         script.run_env()
 
@@ -530,7 +538,40 @@ def downgrade(
         starting_rev=starting_rev,
         destination_rev=revision,
         tag=tag,
+        **_verify_digests_environment_opt(config),
     ):
+        script.run_env()
+
+
+def adopt_digests(config: Config) -> None:
+    """Record content digests for all currently applied revisions.
+
+    This enables revision digest verification for a pre-existing
+    database.
+
+    The full executed revision closure implied by the current database
+    heads is computed and a digest of each revision's migration file
+    and graph declarations is recorded.  Adoption is refused, recording
+    nothing, if any revision or migration file is missing or if the
+    revision graph is incomplete.
+
+    :param config: a :class:`.Config` instance.
+
+    """
+
+    script = ScriptDirectory.from_config(config)
+
+    def do_adopt(rev, context):
+        adopted = context.adopt_revision_digests()
+        for adopted_script in sorted(
+            adopted, key=lambda adopted_script: adopted_script.revision
+        ):
+            config.print_stdout(
+                "Recorded digest for revision %s", adopted_script.revision
+            )
+        return []
+
+    with EnvironmentContext(config, script, fn=do_adopt, dont_mutate=True):
         script.run_env()
 
 
