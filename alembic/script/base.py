@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from ..util import not_none
 from ..util.pyfiles import _preserving_path_as_str
 
 if TYPE_CHECKING:
+    from ..plan import MigrationPlan
     from .revision import _GetRevArg
     from .revision import _RevIdType
     from .revision import Revision
@@ -407,6 +409,26 @@ class ScriptDirectory:
 
         """
         return list(self.revision_map.bases)
+
+    def plan(
+        self,
+        current_revisions: Iterable[str] | None,
+        target: str,
+        direction: str = "upgrade",
+    ) -> MigrationPlan:
+        """Produce an offline migration plan for this script directory.
+
+        This is a convenience wrapper around
+        :func:`alembic.plan.plan_migrations`; see that function for
+        details.  No database connection is established and no
+        ``upgrade()`` / ``downgrade()`` functions are invoked.
+
+        """
+        from ..plan import plan_migrations
+
+        return plan_migrations(
+            self, current_revisions, target, direction=direction
+        )
 
     def _upgrade_revs(
         self, destination: str, current_rev: str
