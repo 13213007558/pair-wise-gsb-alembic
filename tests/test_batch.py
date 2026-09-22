@@ -3,6 +3,7 @@ import random
 import re
 
 from sqlalchemy import Boolean
+from sqlalchemy import cast
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import Computed
@@ -18,6 +19,7 @@ from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import JSON
 from sqlalchemy import MetaData
+from sqlalchemy import Numeric
 from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import select
 from sqlalchemy import String
@@ -1345,6 +1347,263 @@ class CopyFromTest(TestBase):
         )
 
 
+class CopyValuesTest(TestBase):
+    """test the copy_values argument of batch_alter_table()."""
+
+    def _fixture(self):
+        self.metadata = MetaData()
+        self.table = Table(
+            "foo",
+            self.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50)),
+            Column("x", Integer),
+            Column("y", Integer),
+        )
+
+        context = op_fixture(dialect="sqlite", as_sql=True)
+        self.op = Operations(context)
+        return context
+
+    def test_rename_w_transform(self):
+        context = self._fixture()
+        self.table.append_column(Column("cents", Integer))
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            copy_values={"amount": column("cents") / 100.0},
+        ) as batch_op:
+            batch_op.alter_column(
+                "cents",
+                new_column_name="amount",
+                type_=Numeric(10, 2),
+                existing_type=Integer(),
+            )
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER, "
+            "amount NUMERIC(10, 2), PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y, amount) "
+            "SELECT foo.id, foo.data, foo.x, foo.y, "
+            "foo.cents / (? + 0.0) AS amount FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_add_not_null_column_w_value(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            recreate="always",
+            copy_values={"total": column("x") + column("y")},
+        ) as batch_op:
+            batch_op.add_column(Column("total", Integer, nullable=False))
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER, total INTEGER NOT NULL, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y, total) "
+            "SELECT foo.id, foo.data, foo.x, foo.y, "
+            "foo.x + foo.y AS total FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_swap_columns(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            recreate="always",
+            copy_values=[("x", column("y")), ("y", column("x"))],
+        ) as batch_op:
+            pass
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y) "
+            "SELECT foo.id, foo.data, foo.y, foo.x FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_drop_source_column(self):
+        context = self._fixture()
+        self.table.append_column(Column("cents", Integer))
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            copy_values={"amount": column("cents") / 100.0},
+        ) as batch_op:
+            batch_op.add_column(
+                Column("amount", Numeric(10, 2), nullable=False)
+            )
+            batch_op.drop_column("cents")
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "amount NUMERIC(10, 2) NOT NULL, data VARCHAR(50), "
+            "x INTEGER, y INTEGER, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, amount, data, x, y) "
+            "SELECT foo.id, foo.cents / (? + 0.0) AS amount, "
+            "foo.data, foo.x, foo.y FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_table_bound_expression(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            recreate="always",
+            copy_values={"total": self.table.c.x + self.table.c.y},
+        ) as batch_op:
+            batch_op.add_column(Column("total", Integer))
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER, total INTEGER, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y, total) "
+            "SELECT foo.id, foo.data, foo.x, foo.y, "
+            "foo.x + foo.y AS total FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_plain_value_coerced_to_literal(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            recreate="always",
+            copy_values={"flag": 1},
+        ) as batch_op:
+            batch_op.add_column(Column("flag", Integer, nullable=False))
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "data VARCHAR(50), x INTEGER, y INTEGER, "
+            "flag INTEGER NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, data, x, y, flag) "
+            "SELECT foo.id, foo.data, foo.x, foo.y, ? AS flag FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_unknown_target_column(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Can't apply copy_values expression to column 'q'; "
+            "no column of that name will be present in the new version "
+            "of table 'foo'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="always",
+                copy_values={"q": column("x")},
+            ) as batch_op:
+                pass
+        # rejected before the new table is created
+        context.assert_()
+
+    def test_target_column_dropped(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Can't apply copy_values expression to column 'y'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                copy_values={"y": column("x")},
+            ) as batch_op:
+                batch_op.drop_column("y")
+        context.assert_()
+
+    def test_duplicate_assignment(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "copy_values contains more than one entry for column 'x'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="always",
+                copy_values=[("x", column("y")), ("x", column("data"))],
+            ) as batch_op:
+                pass
+        context.assert_()
+
+    def test_expression_refers_to_new_column(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "copy_values expression for column 'total' refers to column "
+            "'doubled', which is not present in the existing table 'foo'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="always",
+                copy_values={"total": column("doubled") * 2},
+            ) as batch_op:
+                batch_op.add_column(Column("doubled", Integer))
+                batch_op.add_column(Column("total", Integer))
+        context.assert_()
+
+    def test_expression_refers_to_other_table(self):
+        context = self._fixture()
+        other = Table("bar", MetaData(), Column("x", Integer))
+        with expect_raises_message(
+            CommandError,
+            "copy_values expression for column 'total' refers to "
+            "table 'bar'",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="always",
+                copy_values={"total": other.c.x},
+            ) as batch_op:
+                batch_op.add_column(Column("total", Integer))
+        context.assert_()
+
+    def test_computed_column_target(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Can't apply copy_values expression to column 'total'; "
+            "the column is a generated column",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="always",
+                copy_values={"total": column("x")},
+            ) as batch_op:
+                batch_op.add_column(
+                    Column("total", Integer, Computed("x + y"))
+                )
+        context.assert_()
+
+    def test_requires_recreate(self):
+        self._fixture()
+        with expect_raises_message(
+            CommandError,
+            r"The 'copy_values' argument to batch_alter_table\(\) requires "
+            "that the table be recreated",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                copy_values={"total": column("x")},
+            ) as batch_op:
+                batch_op.add_column(Column("total", Integer))
+
+
 class _BatchRoundTripBase:
     """common fixtures for the batch round trip tests.
 
@@ -2549,6 +2808,197 @@ class BatchRoundTripPostgresqlTest(BatchRoundTripTest):
             ],
             [Boolean],
         )
+
+
+class BatchCopyValuesRoundTripTest(_BatchRoundTripBase, TestBase):
+    __only_on__ = "sqlite"
+
+    @testing.fixture(autouse=True)
+    def _account_fixture(self, metadata, connection):
+        with connection.begin():
+            t = Table(
+                "account",
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("cents", Integer),
+                Column("x", Integer),
+                Column("y", Integer),
+            )
+            t.create(connection)
+            connection.execute(
+                t.insert(),
+                [
+                    {"id": 1, "cents": 12345, "x": 5, "y": 10},
+                    {"id": 2, "cents": 50, "x": 7, "y": 20},
+                ],
+            )
+
+    def _table_names(self, connection):
+        return inspect(connection).get_table_names()
+
+    def test_rename_w_transform(self, connection):
+        with self.op.batch_alter_table(
+            "account",
+            copy_values={"amount": column("cents") / 100.0},
+        ) as batch_op:
+            batch_op.alter_column(
+                "cents",
+                new_column_name="amount",
+                type_=Numeric(10, 2),
+                existing_type=Integer(),
+            )
+
+        eq_(
+            connection.exec_driver_sql(
+                "select id, amount from account order by id"
+            ).fetchall(),
+            [(1, 123.45), (2, 0.5)],
+        )
+        eq_(
+            [
+                c["name"]
+                for c in inspect(connection).get_columns("account")
+            ],
+            ["id", "amount", "x", "y"],
+        )
+
+    def test_add_not_null_column_derived(self, connection):
+        with self.op.batch_alter_table(
+            "account",
+            recreate="always",
+            copy_values={"total": column("x") + column("y")},
+        ) as batch_op:
+            batch_op.add_column(Column("total", Integer, nullable=False))
+
+        eq_(
+            connection.exec_driver_sql(
+                "select id, total from account order by id"
+            ).fetchall(),
+            [(1, 15), (2, 27)],
+        )
+
+    def test_swap_columns(self, connection):
+        with self.op.batch_alter_table(
+            "account",
+            recreate="always",
+            copy_values=[("x", column("y")), ("y", column("x"))],
+        ) as batch_op:
+            pass
+
+        eq_(
+            connection.exec_driver_sql(
+                "select id, x, y from account order by id"
+            ).fetchall(),
+            [(1, 10, 5), (2, 20, 7)],
+        )
+
+    def test_drop_source_column(self, connection):
+        with self.op.batch_alter_table(
+            "account",
+            copy_values={"amount": column("cents") / 100.0},
+        ) as batch_op:
+            batch_op.add_column(
+                Column("amount", Numeric(10, 2), nullable=False)
+            )
+            batch_op.drop_column("cents")
+
+        eq_(
+            connection.exec_driver_sql(
+                "select id, amount from account order by id"
+            ).fetchall(),
+            [(1, 123.45), (2, 0.5)],
+        )
+        assert "cents" not in [
+            c["name"] for c in inspect(connection).get_columns("account")
+        ]
+
+    def test_reverse_transform_declared_by_migration(self, connection):
+        # alembic does not reverse copy_values expressions; a downgrade
+        # declares its own
+        with self.op.batch_alter_table(
+            "account",
+            copy_values={"amount": column("cents") / 100.0},
+        ) as batch_op:
+            batch_op.alter_column(
+                "cents",
+                new_column_name="amount",
+                type_=Numeric(10, 2),
+                existing_type=Integer(),
+            )
+
+        with self.op.batch_alter_table(
+            "account",
+            copy_values={"cents": cast(column("amount") * 100, Integer)},
+        ) as batch_op:
+            batch_op.alter_column(
+                "amount",
+                new_column_name="cents",
+                type_=Integer(),
+                existing_type=Numeric(10, 2),
+            )
+
+        eq_(
+            connection.exec_driver_sql(
+                "select id, cents from account order by id"
+            ).fetchall(),
+            [(1, 12345), (2, 50)],
+        )
+
+    def test_transform_violates_constraint(self, connection, metadata):
+        # the transformed values violate the new CHECK constraint;
+        # the failed batch must leave the original table in place
+        with expect_raises_message(
+            sqla_exc.IntegrityError, "CHECK constraint failed"
+        ):
+            with self.op.batch_alter_table(
+                "account",
+                table_args=(CheckConstraint("amount < 100"),),
+                copy_values={"amount": column("cents") / 100.0},
+            ) as batch_op:
+                batch_op.add_column(
+                    Column("amount", Numeric(10, 2), nullable=False)
+                )
+                batch_op.drop_column("cents")
+
+        tables = self._table_names(connection)
+        assert "account" in tables
+        eq_(
+            connection.exec_driver_sql(
+                "select id, cents from account order by id"
+            ).fetchall(),
+            [(1, 12345), (2, 50)],
+        )
+
+        # the pysqlite driver's legacy transaction handling commits the
+        # CREATE of the temp table but rolls back the cleanup DROP, so a
+        # leftover _alembic_tmp table is expected here (pre-existing
+        # SQLite behavior, unrelated to copy_values); reflect it into
+        # the metadata so that the fixture teardown drops it
+        metadata.reflect(connection)
+
+    def test_unknown_target_column_leaves_table(self, connection):
+        with expect_raises_message(
+            CommandError, "no column of that name"
+        ):
+            with self.op.batch_alter_table(
+                "account",
+                recreate="always",
+                copy_values={"nope": column("x")},
+            ) as batch_op:
+                pass
+
+        tables = self._table_names(connection)
+        assert "account" in tables
+        assert "_alembic_tmp_account" not in tables
+
+    def test_copy_values_requires_recreate(self, connection):
+        with expect_raises_message(
+            CommandError, "requires that the table be recreated"
+        ):
+            with self.op.batch_alter_table(
+                "account", copy_values={"total": column("x")}
+            ) as batch_op:
+                batch_op.add_column(Column("total", Integer))
 
 
 class BatchNamingConventionTest(_BatchRoundTripBase, TestBase):

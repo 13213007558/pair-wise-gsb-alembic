@@ -244,6 +244,9 @@ class AbstractOperations(util.ModuleClsProxy):
         recreate: Literal["auto", "always", "never"] = "auto",
         partial_reordering: list[tuple[str, ...]] | None = None,
         copy_from: Table | None = None,
+        copy_values: Mapping[str, Any] | Sequence[tuple[str, Any]] | None = (
+            None
+        ),
         table_args: tuple[Any, ...] = (),
         table_kwargs: Mapping[str, Any] = util.immutabledict(),
         reflect_args: tuple[Any, ...] = (),
@@ -318,6 +321,45 @@ class AbstractOperations(util.ModuleClsProxy):
             :paramref:`~.Operations.batch_alter_table.reflect_args`
 
             :paramref:`~.Operations.batch_alter_table.reflect_kwargs`
+
+        :param copy_values: optional mapping that associates the name of a
+         column in the new version of the table with a SQLAlchemy SQL
+         expression, used to produce the value for that column within the
+         "INSERT from SELECT" data copy step of a "move and copy" batch
+         migration.  This allows values to be transformed in place as the
+         table is rebuilt, e.g. to populate a renamed or newly added column
+         from an expression that refers to the existing columns::
+
+            with op.batch_alter_table(
+                "account",
+                copy_values={"amount": column("cents") / 100.0},
+            ) as batch_op:
+                batch_op.alter_column(
+                    "cents",
+                    new_column_name="amount",
+                    type_=Numeric(10, 2),
+                    existing_type=Integer(),
+                )
+
+         Expressions are evaluated against the table as it exists *before*
+         the rebuild, so they may refer to columns that are renamed or
+         dropped within the same batch; references to columns that don't
+         exist in the pre-rebuild table, such as columns newly added by
+         the batch itself, are rejected.  A sequence of ``(name,
+         expression)`` tuples may be passed in place of a mapping; entries
+         that name a column more than once, that name a column not present
+         in the new table, or that target a generated column are rejected
+         before the new table is created.  Columns not named in
+         ``copy_values`` are copied using the usual rules.  The parameter
+         requires that the table is actually recreated, and may be combined
+         with :paramref:`~.Operations.batch_alter_table.copy_from` for
+         offline SQL generation.
+
+         Alembic does not attempt to reverse ``copy_values`` expressions;
+         a downgrade that restores the original values should declare its
+         own ``copy_values``.
+
+         .. versionadded:: 1.20.1
 
         :param reflect_args: a sequence of additional positional arguments that
          will be applied to the table structure being reflected / copied;
@@ -398,6 +440,7 @@ class AbstractOperations(util.ModuleClsProxy):
             reflect_kwargs,
             naming_convention,
             partial_reordering,
+            copy_values,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
         yield batch_op

@@ -100,6 +100,66 @@ The reflection process may also be bypassed entirely by sending a
 pre-fabricated :class:`~sqlalchemy.schema.Table` object; see
 :ref:`batch_offline_mode` for an example.
 
+.. _batch_copy_values:
+
+Transforming Values During the Copy
+-----------------------------------
+
+When a table is rebuilt using "move and copy", values for individual
+columns of the new table may be derived from SQL expressions that are
+evaluated within the "INSERT from SELECT" data copy, using the
+:paramref:`~.Operations.batch_alter_table.copy_values` parameter of
+:meth:`.Operations.batch_alter_table`.  This accommodates migrations that
+need to convert data in place as the table is rebuilt, such as renaming a
+column while also rescaling its values::
+
+    with op.batch_alter_table(
+        "account",
+        copy_values={"amount": column("cents") / 100.0},
+    ) as batch_op:
+        batch_op.alter_column(
+            "cents",
+            new_column_name="amount",
+            type_=Numeric(10, 2),
+            existing_type=Integer(),
+        )
+
+The keys of ``copy_values`` name columns of the **new** table, and the
+values are SQLAlchemy SQL expressions that refer to columns of the table
+as it exists **before** the rebuild, either as free-standing
+:func:`~sqlalchemy.sql.expression.column` references as above, or as
+columns of the :class:`~sqlalchemy.schema.Table` that is being copied.
+Because expressions are resolved against the pre-rebuild table, they may
+freely refer to columns that are renamed or dropped within the same
+batch; in the example above, ``cents`` no longer exists under that name
+in the new table, yet remains available as the source of the expression.
+A newly added column may be populated the same way, including one that is
+``NOT NULL`` and has no default::
+
+    with op.batch_alter_table(
+        "account",
+        copy_values={"total": column("subtotal") + column("tax")},
+    ) as batch_op:
+        batch_op.add_column(Column("total", Integer, nullable=False))
+
+Columns that are not named in ``copy_values`` are copied using the usual
+rules.  Entries that name a column which won't be present in the new
+table, that name the same column more than once, that target a generated
+column, or whose expressions refer to columns that don't exist in the
+pre-rebuild table (such as columns newly added by the batch itself) are
+rejected before the new table is created.  ``copy_values`` requires that
+the table is actually recreated; if the batch would otherwise proceed
+using plain ALTER statements, ``recreate="always"`` should be passed.
+The parameter may be combined with
+:paramref:`~.Operations.batch_alter_table.copy_from` to generate the
+"move and copy" SQL in offline mode.
+
+Alembic does not attempt to reverse ``copy_values`` expressions; a
+downgrade that restores the original values should declare its own
+``copy_values``.
+
+.. versionadded:: 1.20.1
+
 .. _sqlite_batch_constraints:
 
 Dealing with Constraints

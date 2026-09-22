@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 from typing import TYPE_CHECKING
 
@@ -10,12 +11,18 @@ from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import Index
+from sqlalchemy import literal
 from sqlalchemy import MetaData
 from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
 from sqlalchemy import types as sqltypes
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.elements import ClauseElement
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.elements import ColumnClause
+from sqlalchemy.sql.elements import Label
 from sqlalchemy.sql.schema import SchemaEventTarget
 from sqlalchemy.util import OrderedDict
 from sqlalchemy.util import topological
@@ -42,7 +49,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.engine import Dialect
-    from sqlalchemy.sql.elements import ColumnClause
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.schema import Constraint
     from sqlalchemy.sql.type_api import TypeEngine
@@ -65,6 +71,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        copy_values,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +94,7 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        self.copy_values = copy_values
         self.batch = []
 
     @property
@@ -110,6 +118,15 @@ class BatchOperationsImpl:
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
+                if self.copy_values:
+                    raise exc.CommandError(
+                        "The 'copy_values' argument to batch_alter_table() "
+                        "requires that the table be recreated using the "
+                        "'move and copy' procedure; it can't be applied "
+                        "when batch mode proceeds using direct ALTER "
+                        "statements.  Pass recreate='always' to force "
+                        "the table to be recreated."
+                    )
                 for opname, arg, kw in self.batch:
                     fn = getattr(self.operations.impl, opname)
                     fn(*arg, **kw)
@@ -165,6 +182,7 @@ class BatchOperationsImpl:
                     self.table_kwargs,
                     reflected,
                     partial_reordering=self.partial_reordering,
+                    copy_values=self.copy_values,
                 )
                 for opname, arg, kw in self.batch:
                     fn = getattr(batch_impl, opname)
@@ -228,6 +246,7 @@ class ApplyBatchImpl:
         table_kwargs: dict[str, Any],
         reflected: bool,
         partial_reordering: tuple = (),
+        copy_values: Any = None,
     ) -> None:
         self.impl = impl
         self.table = table  # this is a Table object
@@ -240,6 +259,7 @@ class ApplyBatchImpl:
         self.add_col_ordering: tuple[
             tuple[str, str], ...
         ] = ()  # tuple of tuples
+        self.copy_values = copy_values
 
         self.column_transfers = OrderedDict(
             (c.name, {"expr": c}) for c in self.table.c
@@ -467,7 +487,109 @@ class ApplyBatchImpl:
                     schema=referent_schema,
                 )
 
+    def _apply_copy_values(self) -> None:
+        if not self.copy_values:
+            return
+
+        if isinstance(self.copy_values, Mapping):
+            copy_values = list(self.copy_values.items())
+        else:
+            copy_values = list(self.copy_values)
+
+        # keys of self.columns / self.column_transfers are the original
+        # column keys; the Column objects in self.columns carry the new
+        # names for columns that were renamed within the batch, so the
+        # target of a copy_values entry is matched by new column name.
+        target_names = {col.name: key for key, col in self.columns.items()}
+
+        seen = set()
+        for target_name, expr in copy_values:
+            if target_name in seen:
+                raise exc.CommandError(
+                    f"copy_values contains more than one entry for "
+                    f"column '{target_name}'"
+                )
+            seen.add(target_name)
+            try:
+                key = target_names[target_name]
+            except KeyError:
+                raise exc.CommandError(
+                    f"Can't apply copy_values expression to column "
+                    f"'{target_name}'; no column of that name will be "
+                    f"present in the new version of table "
+                    f"'{self.table.name}'"
+                ) from None
+            column = self.columns[key]
+            if column.computed is not None:
+                raise exc.CommandError(
+                    f"Can't apply copy_values expression to column "
+                    f"'{target_name}'; the column is a generated column "
+                    f"and may not be written to directly"
+                )
+            resolved = self._resolve_copy_value_expression(
+                target_name, expr
+            )
+            if isinstance(resolved, ColumnElement) and not isinstance(
+                resolved, (Column, Label)
+            ):
+                # label computed expressions with the target column name
+                # so that the generated SELECT is deterministic and
+                # remains readable in --sql mode
+                resolved = resolved.label(target_name)
+            self.column_transfers[key]["expr"] = resolved
+
+    def _resolve_copy_value_expression(
+        self, target_name: str, expr: Any
+    ) -> ClauseElement:
+        """Resolve a copy_values expression against the existing table.
+
+        Free-standing column references (e.g. ``column("cents")``) are
+        bound to the columns of the table as it exists before the
+        rebuild, so that rename and drop directives within the batch
+        don't remove the source of the expression.  References to
+        columns that don't exist in the existing table, such as columns
+        that are newly added by the batch itself, are rejected.
+
+        """
+        source_table = self.table
+
+        if not isinstance(expr, ClauseElement):
+            expr = literal(expr)
+
+        def replace(obj: Any) -> Any:
+            if not isinstance(obj, ColumnClause) or obj.is_literal:
+                return None
+            if isinstance(obj, Column) and obj.table is not None:
+                if obj.table is source_table:
+                    return None
+                if (obj.table.name, obj.table.schema) != (
+                    source_table.name,
+                    source_table.schema,
+                ):
+                    raise exc.CommandError(
+                        f"copy_values expression for column "
+                        f"'{target_name}' refers to table "
+                        f"'{obj.table.name}'; expressions may only refer "
+                        f"to columns of the table being migrated "
+                        f"('{source_table.name}')"
+                    )
+            try:
+                return source_table.c[obj.name]
+            except KeyError:
+                raise exc.CommandError(
+                    f"copy_values expression for column '{target_name}' "
+                    f"refers to column '{obj.name}', which is not present "
+                    f"in the existing table '{source_table.name}'.  "
+                    f"copy_values expressions are evaluated against the "
+                    f"table as it exists before the rebuild; they can't "
+                    f"refer to columns that are added by the batch "
+                    f"itself."
+                ) from None
+
+        return visitors.replacement_traverse(expr, {}, replace)
+
     def _create(self, op_impl: DefaultImpl) -> None:
+        self._apply_copy_values()
         self._transfer_elements_to_new_table()
 
         op_impl.prep_table_for_batch(self, self.table)
