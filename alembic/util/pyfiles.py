@@ -133,6 +133,60 @@ def load_module_py(module_id: str, path: str | os.PathLike[str]) -> ModuleType:
     return module
 
 
+class _VerifiedBytesSourceLoader(importlib.machinery.SourceFileLoader):
+    """A SourceFileLoader that serves pre-read, verified byte content."""
+
+    def __init__(self, fullname: str, path: str, data: bytes) -> None:
+        super().__init__(fullname, path)
+        self._verified_data = data
+
+    def get_data(self, path: str) -> bytes:
+        return self._verified_data
+
+
+class _VerifiedBytesSourcelessLoader(
+    importlib.machinery.SourcelessFileLoader
+):
+    """A SourcelessFileLoader that serves pre-read, verified bytes."""
+
+    def __init__(self, fullname: str, path: str, data: bytes) -> None:
+        super().__init__(fullname, path)
+        self._verified_data = data
+
+    def get_data(self, path: str) -> bytes:
+        return self._verified_data
+
+
+def load_module_py_verified(
+    module_id: str, path: str | os.PathLike[str], data: bytes
+) -> ModuleType:
+    """Load a Python module from pre-verified bytes.
+
+    The module is loaded exactly as though its content were read from
+    ``path``: ``__file__`` points at ``path``, source encoding
+    declarations are honored, and import semantics are unchanged.
+    However, ``data`` is used as the file content instead of reading
+    the file from disk again, so that content verified against a
+    revision manifest is what actually executes even if the file is
+    replaced between verification and module load.
+
+    """
+    path_as_str = _preserving_path_as_str(path)
+    if path_as_str.endswith(".py"):
+        loader: importlib.machinery.FileLoader = _VerifiedBytesSourceLoader(
+            module_id, path_as_str, data
+        )
+    else:
+        loader = _VerifiedBytesSourcelessLoader(module_id, path_as_str, data)
+    spec = importlib.util.spec_from_file_location(
+        module_id, path_as_str, loader=loader
+    )
+    assert spec
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def _preserving_path_as_str(path: str | os.PathLike[str]) -> str:
     """receive str/pathlike and return a string.
 

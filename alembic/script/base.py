@@ -15,6 +15,7 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from . import manifest
 from . import revision
 from . import write_hooks
 from .. import util
@@ -77,6 +78,7 @@ class ScriptDirectory:
         timezone: str | None = None,
         hooks: list[PostWriteHookConfig] = [],
         recursive_version_locations: bool = False,
+        revision_manifest: str | os.PathLike[str] | None = None,
         messaging_opts: MessagingOptions = cast(
             "MessagingOptions", util.EMPTY_DICT
         ),
@@ -93,6 +95,12 @@ class ScriptDirectory:
         self.timezone = timezone
         self.hooks = hooks
         self.recursive_version_locations = recursive_version_locations
+        self.revision_manifest = (
+            _preserving_path_as_str(revision_manifest)
+            if revision_manifest is not None
+            else None
+        )
+        self._verified_revision_files: dict[Path, bytes] | None = None
         self.messaging_opts = messaging_opts
 
         if not os.access(dir, os.F_OK):
@@ -131,7 +139,28 @@ class ScriptDirectory:
         else:
             return [Path(self.dir, "versions").absolute()]
 
+    def _candidate_revision_files(self) -> Iterator[Path]:
+        """Yield the resolved paths of revision files currently present
+        in the version locations."""
+        if self.sourceless:
+            pattern = _sourceless_rev_file
+        else:
+            pattern = _only_source_rev_file
+        for vers in self._version_locations:
+            if not vers.exists():
+                continue
+            for file_path in Script._list_py_dir(self, vers):
+                if pattern.match(file_path.name):
+                    yield file_path.resolve()
+
     def _load_revisions(self) -> Iterator[Script]:
+        if self.revision_manifest is not None:
+            self._verified_revision_files = manifest.verify_revision_files(
+                self.revision_manifest,
+                self._version_locations,
+                self._candidate_revision_files(),
+            )
+
         paths = [vers for vers in self._version_locations if vers.exists()]
 
         dupes = set()
@@ -184,6 +213,7 @@ class ScriptDirectory:
             ),
             truncate_slug_length=truncate_slug_length,
             sourceless=config.get_alembic_boolean_option("sourceless"),
+            revision_manifest=config.get_alembic_option("revision_manifest"),
             output_encoding=config.get_alembic_option(
                 "output_encoding", "utf-8"
             ),
@@ -1036,7 +1066,21 @@ class Script(revision.Revision):
             if py_exists or is_o and pyc_exists:
                 return None
 
-        module = util.load_python_file(dir_, filename)
+        verified_files = scriptdir._verified_revision_files
+        verified_data = (
+            verified_files.get(path.resolve())
+            if verified_files is not None
+            else None
+        )
+        if verified_data is not None:
+            # strict manifest mode: execute the exact bytes that were
+            # verified against the manifest, so that a file replaced
+            # between verification and now is not loaded.
+            module = util.load_module_py_verified(
+                re.sub(r"\W", "_", filename), path, verified_data
+            )
+        else:
+            module = util.load_python_file(dir_, filename)
 
         if not hasattr(module, "revision"):
             # attempt to get the revision id from the script name,

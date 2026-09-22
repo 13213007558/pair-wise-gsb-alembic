@@ -432,6 +432,27 @@ This file contains the following features:
 
   .. versionadded:: 1.10
 
+* ``revision_manifest`` - an optional path to a revision manifest file.
+  When set, Alembic runs in a strict integrity-check mode: before any
+  Python migration module is loaded (e.g. for ``upgrade``,
+  ``downgrade`` or any command that reads the revision graph), the
+  revision files present in the version locations are verified against
+  the manifest, and only the verified file contents are executed.  If a
+  revision file was modified, is missing, or an unlisted revision file
+  is present, the command aborts and reports the offending paths.
+
+  The manifest is a plain text file compatible with ``sha256sum``
+  output; each line contains a SHA-256 hex digest, whitespace, and the
+  path of a revision file relative to the directory containing the
+  manifest file.  Empty lines and lines starting with ``#`` are
+  ignored.  Entries may span multiple ``version_locations``
+  directories; duplicate entries, paths that escape the declared
+  version locations, and symbolic link aliases of the same file are
+  rejected.
+
+  This is an integrity check for trusted release packages; it is not a
+  Python sandbox and does not provide signatures or key management.
+
 * ``output_encoding`` - the encoding to use when Alembic writes the
   ``script.py.mako`` file into a new migration file.  Defaults to ``'utf-8'``.
 
@@ -1050,5 +1071,4 @@ Next Steps
 
 The vast majority of Alembic environments make heavy use of the
 "autogenerate" feature.   Continue onto the next section, :doc:`autogenerate`.
-
 

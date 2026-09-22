@@ -79,6 +79,13 @@ path_separator = os
 # new in Alembic version 1.10
 # recursive_version_locations = false
 
+# path to a revision manifest file, listing allowed revision files
+# and their SHA-256 digests (sha256sum format, paths relative to the
+# manifest file).  When set, revision files are verified against the
+# manifest before any migration module is loaded, and only the
+# verified contents are executed.
+# revision_manifest = %(here)s/revision_manifest.txt
+
 # the output encoding used when revision files
 # are written from script.py.mako
 # output_encoding = utf-8
