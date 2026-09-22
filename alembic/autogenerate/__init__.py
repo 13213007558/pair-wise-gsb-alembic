@@ -5,6 +5,8 @@ from .api import render_python_code as render_python_code
 from .api import RevisionContext as RevisionContext
 from .compare import _produce_net_changes as _produce_net_changes
 from .compare import comparators as comparators
+from .order import OpOrderingError as OpOrderingError
+from .order import sort_ops as sort_ops
 from .render import render_op_text as render_op_text
 from .render import renderers as renderers
 from .rewriter import Rewriter as Rewriter

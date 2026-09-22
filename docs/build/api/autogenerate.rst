@@ -43,6 +43,10 @@ which produces a structure consisting of operation directives detailed in
 
 .. autofunction:: alembic.autogenerate.produce_migrations
 
+.. autofunction:: alembic.autogenerate.sort_ops
+
+.. autoclass:: alembic.autogenerate.OpOrderingError
+
 .. _customizing_revision:
 
 Customizing Revision Generation
@@ -628,4 +632,3 @@ in our migration file::
 
 These are our custom directives that will invoke when ``alembic upgrade``
 or ``alembic downgrade`` is run.
-

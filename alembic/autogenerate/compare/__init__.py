@@ -9,6 +9,7 @@ from . import schema
 from . import server_defaults
 from . import tables
 from . import types
+from .. import order
 from ... import util
 from ...ext import checkconstraint_byname
 from ...runtime.plugins import Plugin
@@ -38,7 +39,11 @@ def _populate_migration_script(
     downgrade_ops = migration_script.downgrade_ops_list[-1]
 
     _produce_net_changes(autogen_context, upgrade_ops)
+    if autogen_context.opts.get("autogenerate_order_ops", False):
+        order.sort_ops(upgrade_ops)
     upgrade_ops.reverse_into(downgrade_ops)
+    if autogen_context.opts.get("autogenerate_order_ops", False):
+        order.sort_ops(downgrade_ops)
 
 
 def _produce_net_changes(

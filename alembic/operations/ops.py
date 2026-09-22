@@ -10,9 +10,12 @@ import re
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import NamedTuple
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from sqlalchemy.sql.schema import Column
+from sqlalchemy.sql.schema import ForeignKeyConstraint
 from sqlalchemy.types import NULLTYPE
 
 from . import schemaobj
@@ -30,9 +33,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.elements import TextClause
     from sqlalchemy.sql.schema import CheckConstraint
-    from sqlalchemy.sql.schema import Column
     from sqlalchemy.sql.schema import Constraint
-    from sqlalchemy.sql.schema import ForeignKeyConstraint
     from sqlalchemy.sql.schema import Index
     from sqlalchemy.sql.schema import MetaData
     from sqlalchemy.sql.schema import PrimaryKeyConstraint
@@ -49,6 +50,137 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T", bound=Any)
 _AC = TypeVar("_AC", bound="AddConstraintOp")
+
+
+class ObjectRef(NamedTuple):
+    """Identifies a schema-qualified object that an operation
+    creates, reads, or drops.
+
+    Instances of this class are returned within an
+    :class:`.OpDependency` declaration from the
+    :meth:`.MigrateOperation.get_dependencies` method, and are consumed
+    by the optional operation ordering stage in
+    :mod:`alembic.autogenerate.order`.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    name: str
+    """Name of the object, e.g. a table or index name."""
+
+    schema: str | None = None
+    """Schema the object lives in, or None for the default schema."""
+
+    kind: str = "table"
+    """Kind of object, e.g. ``"table"``, ``"index"``.
+
+    Objects of different kinds never interfere with each other, even
+    if their names and schemas are the same.
+    """
+
+    @classmethod
+    def table(cls, name: str, schema: str | None = None) -> ObjectRef:
+        """Return an :class:`.ObjectRef` referring to a table."""
+        return cls(name, schema, "table")
+
+    def __lt__(self, other: ObjectRef) -> bool:
+        return (self.name, self.schema or "", self.kind) < (
+            other.name,
+            other.schema or "",
+            other.kind,
+        )
+
+    def __repr__(self) -> str:
+        if self.schema is not None:
+            qualified = "%s.%s" % (self.schema, self.name)
+        else:
+            qualified = self.name
+        return "%s %r" % (self.kind, qualified)
+
+
+class OpDependency:
+    """Declares which schema-qualified objects an operation creates,
+    reads, or drops.
+
+    This declaration is consumed by the optional operation ordering
+    stage in :mod:`alembic.autogenerate.order`.  Custom operations may
+    return an instance of this class from
+    :meth:`.MigrateOperation.get_dependencies` in order to participate
+    in dependency-based ordering.
+
+    When an object is renamed and also referenced, the declaration
+    expresses both identities as separate :class:`.ObjectRef` entries:
+    e.g. a rename operation *drops* the old name and *creates* the new
+    one, while an operation that refers to the object *reads* whichever
+    identity is current at its own position.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    __slots__ = ("creates", "reads", "drops")
+
+    creates: frozenset[ObjectRef]
+    """Objects that must not exist before this operation runs."""
+
+    reads: frozenset[ObjectRef]
+    """Objects that must exist while this operation runs."""
+
+    drops: frozenset[ObjectRef]
+    """Objects that must not exist after this operation runs."""
+
+    def __init__(
+        self,
+        creates: Sequence[ObjectRef] = (),
+        reads: Sequence[ObjectRef] = (),
+        drops: Sequence[ObjectRef] = (),
+    ) -> None:
+        self.creates = frozenset(creates)
+        self.reads = frozenset(reads)
+        self.drops = frozenset(drops)
+
+    def union(self, other: OpDependency) -> OpDependency:
+        """Return a new declaration combining this one with another."""
+        return OpDependency(
+            creates=self.creates | other.creates,
+            reads=self.reads | other.reads,
+            drops=self.drops | other.drops,
+        )
+
+    def __repr__(self) -> str:
+        parts = []
+        for attr in ("creates", "reads", "drops"):
+            values = getattr(self, attr)
+            if values:
+                parts.append(
+                    "%s={%s}"
+                    % (attr, ", ".join(sorted(map(repr, values))))
+                )
+        return "OpDependency(%s)" % ", ".join(parts)
+
+
+def _fk_target_ref(target_fullname: str) -> ObjectRef | None:
+    """Given a ``ForeignKey.target_fullname`` string, return the
+    :class:`.ObjectRef` for the referent table."""
+    toks = target_fullname.split(".")
+    if len(toks) >= 3:
+        return ObjectRef.table(toks[-2], toks[-3])
+    elif len(toks) == 2:
+        return ObjectRef.table(toks[0])
+    else:
+        return None
+
+
+def _column_fk_refs(column: Column[Any]) -> Iterator[ObjectRef]:
+    for fk in column.foreign_keys:
+        ref = _fk_target_ref(fk.target_fullname)
+        if ref is not None:
+            yield ref
+
+
+def _reads_table(table_name: str, schema: str | None) -> OpDependency:
+    return OpDependency(reads={ObjectRef.table(table_name, schema)})
 
 
 class MigrateOperation:
@@ -81,6 +213,51 @@ class MigrateOperation:
 
     def to_diff_tuple(self) -> tuple[Any, ...]:
         raise NotImplementedError
+
+    def get_dependencies(self) -> OpDependency | None:
+        """Return an :class:`.OpDependency` describing which
+        schema-qualified objects this operation creates, reads, or
+        drops.
+
+        This declaration is consumed by the optional operation ordering
+        stage in :mod:`alembic.autogenerate.order`.  The default
+        implementation returns ``None``, which marks the operation as
+        *unknown*: the ordering stage treats unknown operations as
+        ordering barriers that no other operation may be moved across.
+
+        Custom operations that want to participate in dependency-based
+        ordering should override this method and return an
+        :class:`.OpDependency`.  An operation that declares no
+        dependencies at all may return an empty :class:`.OpDependency`;
+        it will then be freely movable while keeping its relative order
+        against other unconstrained operations.
+
+        .. versionadded:: 1.21.0
+
+        """
+        return None
+
+    def split_off_post_ops(
+        self,
+    ) -> tuple[MigrateOperation, Sequence[MigrateOperation]]:
+        """Split this operation into a main operation and trailing
+        "post" operations.
+
+        This hook is used by the optional operation ordering stage in
+        :mod:`alembic.autogenerate.order`.  Post operations are placed
+        after the main body of operations, which allows an operation to
+        explicitly defer part of its work - typically foreign key
+        constraints that would otherwise form a dependency cycle.  The
+        ordering stage never guesses how to break a cycle; splitting
+        must be declared explicitly here.
+
+        The default implementation returns the operation itself and no
+        post operations.
+
+        .. versionadded:: 1.21.0
+
+        """
+        return self, ()
 
 
 class AddConstraintOp(MigrateOperation):
@@ -153,6 +330,9 @@ class DropConstraintOp(MigrateOperation):
             return ("remove_fk", self.to_constraint())
         else:
             return ("remove_constraint", self.to_constraint())
+
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(self.table_name, self.schema)
 
     @classmethod
     def from_constraint(cls, constraint: Constraint) -> DropConstraintOp:
@@ -262,6 +442,9 @@ class CreatePrimaryKeyOp(AddConstraintOp):
     """Represent a create primary key operation."""
 
     constraint_type = "primarykey"
+
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(self.table_name, self.schema)
 
     def __init__(
         self,
@@ -386,6 +569,9 @@ class CreateUniqueConstraintOp(AddConstraintOp):
     """Represent a create unique constraint operation."""
 
     constraint_type = "unique"
+
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(self.table_name, self.schema)
 
     def __init__(
         self,
@@ -521,6 +707,18 @@ class CreateForeignKeyOp(AddConstraintOp):
     """Represent a create foreign key constraint operation."""
 
     constraint_type = "foreignkey"
+
+    def get_dependencies(self) -> OpDependency:
+        return OpDependency(
+            reads={
+                ObjectRef.table(
+                    self.source_table, self.kw.get("source_schema")
+                ),
+                ObjectRef.table(
+                    self.referent_table, self.kw.get("referent_schema")
+                ),
+            }
+        )
 
     def __init__(
         self,
@@ -750,6 +948,9 @@ class CreateCheckConstraintOp(AddConstraintOp):
 
     constraint_type = "check"
 
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(self.table_name, self.schema)
+
     def __init__(
         self,
         constraint_name: sqla_compat._ConstraintNameDefined | None,
@@ -898,6 +1099,15 @@ class CreateIndexOp(MigrateOperation):
         self.unique = unique
         self.if_not_exists = if_not_exists
         self.kw = kw
+
+    def get_dependencies(self) -> OpDependency:
+        creates = set()
+        if self.index_name is not None:
+            creates.add(ObjectRef(self.index_name, self.schema, "index"))
+        return OpDependency(
+            creates=creates,
+            reads={ObjectRef.table(self.table_name, self.schema)},
+        )
 
     def reverse(self) -> DropIndexOp:
         return DropIndexOp.from_index(self.to_index())
@@ -1051,6 +1261,15 @@ class DropIndexOp(MigrateOperation):
         self.if_exists = if_exists
         self._reverse = _reverse
         self.kw = kw
+
+    def get_dependencies(self) -> OpDependency:
+        drops = set()
+        if self.index_name is not None:
+            drops.add(ObjectRef(str(self.index_name), self.schema, "index"))
+        reads = set()
+        if self.table_name is not None:
+            reads.add(ObjectRef.table(self.table_name, self.schema))
+        return OpDependency(reads=reads, drops=drops)
 
     def to_diff_tuple(self) -> tuple[str, Index]:
         return ("remove_index", self.to_index())
@@ -1229,6 +1448,145 @@ class CreateTableOp(MigrateOperation):
             **self.kw,
         )
 
+    def get_dependencies(self) -> OpDependency:
+        creates = {ObjectRef.table(self.table_name, self.schema)}
+        reads = set()
+        for item in self.columns:
+            if isinstance(item, ForeignKeyConstraint):
+                fks = item.elements
+            elif isinstance(item, Column):
+                fks = item.foreign_keys
+            else:
+                continue
+            for fk in fks:
+                ref = _fk_target_ref(fk.target_fullname)
+                if ref is not None and ref not in creates:
+                    reads.add(ref)
+        return OpDependency(creates=creates, reads=reads)
+
+    def split_off_post_ops(
+        self,
+    ) -> tuple[MigrateOperation, Sequence[MigrateOperation]]:
+        # foreign key constraints marked with use_alter=True are
+        # explicitly declared as deferrable; split them off into
+        # separate create_foreign_key post operations so that mutual
+        # table dependencies do not form an ordering cycle.
+        split_consts = [
+            item
+            for item in self.columns
+            if isinstance(item, ForeignKeyConstraint) and item.use_alter
+        ]
+        split_const_ids = {id(const) for const in split_consts}
+        split_col_fks = [
+            (item, fk)
+            for item in self.columns
+            if isinstance(item, Column)
+            for fk in item.foreign_keys
+            if fk.use_alter and id(fk.constraint) not in split_const_ids
+        ]
+        if not split_consts and not split_col_fks:
+            return self, ()
+
+        # (column name, FK target) pairs to strip from the columns of
+        # the main operation
+        strip = set()
+        for const in split_consts:
+            for col_key, elem in zip(const.column_keys, const.elements):
+                strip.add((col_key, elem.target_fullname))
+        for col, fk in split_col_fks:
+            strip.add((col.name, fk.target_fullname))
+
+        main_columns = []
+        for item in self.columns:
+            if isinstance(item, ForeignKeyConstraint) and item.use_alter:
+                continue
+            if isinstance(item, Column) and any(
+                (item.name, fk.target_fullname) in strip
+                for fk in item.foreign_keys
+            ):
+                new_item = sqla_compat._copy(item)
+                new_item.foreign_keys = {
+                    fk
+                    for fk in new_item.foreign_keys
+                    if (item.name, fk.target_fullname) not in strip
+                }
+                item = new_item
+            main_columns.append(item)
+
+        main_op = CreateTableOp(
+            self.table_name,
+            main_columns,
+            schema=self.schema,
+            if_not_exists=self.if_not_exists,
+            _namespace_metadata=self._namespace_metadata,
+            _constraints_included=self._constraints_included,
+            info=dict(self.info) if self.info else {},
+            comment=self.comment,
+            prefixes=list(self.prefixes) if self.prefixes else None,
+            **self.kw,
+        )
+
+        post_ops: list[MigrateOperation] = []
+        loose_consts = []
+        for const in split_consts:
+            if getattr(const, "parent", None) is not None:
+                post_ops.append(CreateForeignKeyOp.from_constraint(const))
+            else:
+                loose_consts.append(const)
+        if loose_consts:
+            # attach loose constraints to a scratch table built from
+            # *copies* of the columns, so that resolving the foreign
+            # key specs does not mutate the columns held by the main
+            # operation (attaching a ForeignKeyConstraint to a table
+            # links it into the Column objects themselves).
+            scratch = CreateTableOp(
+                self.table_name,
+                [
+                    sqla_compat._copy(item)
+                    if isinstance(item, Column)
+                    else item
+                    for item in self.columns
+                ],
+                schema=self.schema,
+                _namespace_metadata=self._namespace_metadata,
+            )
+            table = scratch.to_table()
+            loose_ids = {id(const) for const in loose_consts}
+            post_ops.extend(
+                CreateForeignKeyOp.from_constraint(const)
+                for const in table.constraints
+                if id(const) in loose_ids
+            )
+        for col, fk in split_col_fks:
+            ref = _fk_target_ref(fk.target_fullname)
+            assert ref is not None
+            name = fk.name
+            if fk.constraint is not None:
+                name = fk.constraint.name
+            post_ops.append(
+                CreateForeignKeyOp(
+                    name,
+                    self.table_name,
+                    ref.name,
+                    [col.name],
+                    [fk.target_fullname.split(".")[-1]],
+                    source_schema=self.schema,
+                    referent_schema=ref.schema,
+                    **{
+                        key: getattr(fk, key)
+                        for key in (
+                            "onupdate",
+                            "ondelete",
+                            "deferrable",
+                            "initially",
+                            "match",
+                        )
+                        if getattr(fk, key) is not None
+                    },
+                )
+            )
+        return main_op, post_ops
+
     @classmethod
     def create_table(
         cls,
@@ -1351,6 +1709,11 @@ class DropTableOp(MigrateOperation):
     def reverse(self) -> CreateTableOp:
         return CreateTableOp.from_table(self.to_table())
 
+    def get_dependencies(self) -> OpDependency:
+        return OpDependency(
+            drops={ObjectRef.table(self.table_name, self.schema)}
+        )
+
     @classmethod
     def from_table(
         cls, table: Table, *, _namespace_metadata: MetaData | None = None
@@ -1439,6 +1802,9 @@ class AlterTableOp(MigrateOperation):
         self.table_name = table_name
         self.schema = schema
 
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(self.table_name, self.schema)
+
 
 @Operations.register_operation("rename_table")
 class RenameTableOp(AlterTableOp):
@@ -1453,6 +1819,12 @@ class RenameTableOp(AlterTableOp):
     ) -> None:
         super().__init__(old_table_name, schema=schema)
         self.new_table_name = new_table_name
+
+    def get_dependencies(self) -> OpDependency:
+        return OpDependency(
+            creates={ObjectRef.table(self.new_table_name, self.schema)},
+            drops={ObjectRef.table(self.table_name, self.schema)},
+        )
 
     @classmethod
     def rename_table(
@@ -2049,6 +2421,11 @@ class AddColumnOp(AlterTableOp):
         op.if_exists = self.if_not_exists
         return op
 
+    def get_dependencies(self) -> OpDependency:
+        reads = {ObjectRef.table(self.table_name, self.schema)}
+        reads.update(_column_fk_refs(self.column))
+        return OpDependency(reads=reads)
+
     def to_diff_tuple(
         self,
     ) -> tuple[str, str | None, str, Column[Any]]:
@@ -2430,6 +2807,11 @@ class BulkInsertOp(MigrateOperation):
         self.rows = rows
         self.multiinsert = multiinsert
 
+    def get_dependencies(self) -> OpDependency:
+        return _reads_table(
+            self.table.name, getattr(self.table, "schema", None)
+        )
+
     @classmethod
     def bulk_insert(
         cls,
@@ -2710,6 +3092,20 @@ class ModifyTableOps(OpContainer):
             ops=list(reversed([op.reverse() for op in self.ops])),
             schema=self.schema,
         )
+
+    def get_dependencies(self) -> OpDependency | None:
+        # the container is treated as an atomic unit by the ordering
+        # stage, so that operations are never moved out of their
+        # table-level (and therefore batch-level) boundary.  If any
+        # contained operation is unknown, the whole container acts as
+        # an ordering barrier.
+        combined = OpDependency()
+        for op in self.ops:
+            deps = op.get_dependencies()
+            if deps is None:
+                return None
+            combined = combined.union(deps)
+        return combined
 
 
 class UpgradeOps(OpContainer):
