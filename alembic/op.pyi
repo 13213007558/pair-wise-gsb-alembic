@@ -315,6 +315,7 @@ def batch_alter_table(
     reflect_args: tuple[Any, ...] = (),
     reflect_kwargs: Mapping[str, Any] = immutabledict({}),
     naming_convention: dict[str, str] | None = None,
+    column_expressions: Mapping[str, ColumnElement[Any]] | None = None,
 ) -> Iterator[BatchOperations]:
     """Invoke a series of per-table migrations in batch.
 
@@ -417,6 +418,38 @@ def batch_alter_table(
      .. seealso::
 
         :ref:`dropping_sqlite_foreign_keys`
+
+    :param column_expressions: a mapping of target column names to
+     SQLAlchemy column expressions, used to populate the values of
+     those columns when the table is recreated using the "move and
+     copy" procedure.  Each expression is evaluated within the
+     INSERT ... SELECT that copies data from the existing table, and
+     may refer to the columns of the table as it exists *before* the
+     batch migration, matched by name; this remains the case even if
+     those columns are renamed or dropped within the same batch.
+     Columns not named in the mapping are copied using the usual
+     rules.  E.g.::
+
+        with op.batch_alter_table(
+            "order",
+            column_expressions={
+                "amount": order_table.c.cents / 100.0,
+            },
+        ) as batch_op:
+            batch_op.add_column(
+                sa.Column("amount", sa.Float(), nullable=False)
+            )
+            batch_op.drop_column("cents")
+
+     Expressions may not refer to columns that are newly added within
+     the same batch, and may not target generated (computed) columns.
+     Passing this argument forces the table to be recreated when
+     recreate is set to "auto", and is incompatible with
+     recreate="never".
+
+     Note that the expressions apply only to the direction of the
+     migration being run; a downgrade that needs to restore the
+     original values must declare its own expressions.
 
     :param partial_reordering: a list of tuples, each suggesting a desired
      ordering of two or more columns in the newly created table.  Requires

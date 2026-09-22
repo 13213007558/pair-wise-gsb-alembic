@@ -9,6 +9,7 @@ from sqlalchemy import Computed
 from sqlalchemy import DateTime
 from sqlalchemy import Enum
 from sqlalchemy import exc as sqla_exc
+from sqlalchemy import Float
 from sqlalchemy import ForeignKey
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy import func
@@ -1345,6 +1346,235 @@ class CopyFromTest(TestBase):
         )
 
 
+class ColumnExpressionsTest(TestBase):
+    def _fixture(self, **kw):
+        self.metadata = MetaData()
+        self.table = Table(
+            "foo",
+            self.metadata,
+            Column("id", Integer, primary_key=True),
+            Column("a", Integer),
+            Column("b", Integer),
+            Column("cents", Integer),
+            **kw,
+        )
+
+        context = op_fixture(dialect="sqlite", as_sql=True)
+        self.op = Operations(context)
+        return context
+
+    def test_rename_column_with_expression(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_expressions={"amount": self.table.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.alter_column(
+                "cents", new_column_name="amount", type_=Float
+            )
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "a INTEGER, b INTEGER, amount FLOAT, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, a, b, amount) "
+            "SELECT foo.id, foo.a, foo.b, "
+            "foo.cents / (? + 0.0) AS anon_1 FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_add_not_null_column_drop_source(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_expressions={"amount": self.table.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.add_column(Column("amount", Float, nullable=False))
+            batch_op.drop_column("cents")
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "amount FLOAT NOT NULL, a INTEGER, b INTEGER, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, amount, a, b) "
+            "SELECT foo.id, foo.cents / (? + 0.0) AS anon_1, "
+            "foo.a, foo.b FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_swap_columns(self):
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_expressions={
+                "a": self.table.c.b,
+                "b": self.table.c.a,
+            },
+        ) as batch_op:
+            pass
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "a INTEGER, b INTEGER, cents INTEGER, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, a, b, cents) "
+            "SELECT foo.id, foo.b, foo.a, foo.cents FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_expression_against_unrelated_table(self):
+        # expressions may be written against any Table object with
+        # matching column names; references are bound to the table
+        # being copied by name
+        context = self._fixture()
+        other = Table(
+            "foo",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("cents", Integer),
+        )
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_expressions={"amount": other.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.add_column(Column("amount", Float, nullable=False))
+            batch_op.drop_column("cents")
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "amount FLOAT NOT NULL, a INTEGER, b INTEGER, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, amount, a, b) "
+            "SELECT foo.id, foo.cents / (? + 0.0) AS anon_1, "
+            "foo.a, foo.b FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_expression_forces_recreate(self):
+        # add_column alone would not require a recreate on SQLite;
+        # the presence of column_expressions forces it
+        context = self._fixture()
+        with self.op.batch_alter_table(
+            "foo",
+            copy_from=self.table,
+            column_expressions={"amount": self.table.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.add_column(Column("amount", Float, nullable=False))
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "a INTEGER, b INTEGER, cents INTEGER, "
+            "amount FLOAT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, a, b, cents, amount) "
+            "SELECT foo.id, foo.a, foo.b, foo.cents, "
+            "foo.cents / (? + 0.0) AS anon_1 FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+    def test_recreate_never_raises(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "The 'column_expressions' argument to batch_alter_table",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                recreate="never",
+                column_expressions={"amount": self.table.c.cents / 100.0},
+            ) as batch_op:
+                batch_op.add_column(Column("amount", Float))
+        context.assert_()
+
+    def test_unknown_target_column(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Can't apply column expression for column 'amount'; no such "
+            "column will be present in the new table.",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_expressions={"amount": self.table.c.cents / 100.0},
+            ) as batch_op:
+                batch_op.alter_column("a", type_=String(20))
+        context.assert_()
+
+    def test_expression_refers_to_new_column(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Column expression for column 'b' refers to column 'amount' "
+            "which is not present in the existing table",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_expressions={"b": column("amount") * 2},
+            ) as batch_op:
+                batch_op.add_column(Column("amount", Float))
+        context.assert_()
+
+    def test_expression_refers_to_unknown_column(self):
+        context = self._fixture()
+        with expect_raises_message(
+            CommandError,
+            "Column expression for column 'b' refers to column 'q' "
+            "which is not present in the existing table",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_expressions={"b": column("q") * 2},
+            ) as batch_op:
+                batch_op.alter_column("a", type_=String(20))
+        context.assert_()
+
+    def test_expression_target_computed_column(self):
+        context = self._fixture()
+        self.table.append_column(
+            Column("g", Integer, Computed("cents * 2", persisted=True))
+        )
+        with expect_raises_message(
+            CommandError,
+            "Can't apply column expression for column 'g'; the column "
+            "is a generated column and can't be assigned a value.",
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                copy_from=self.table,
+                column_expressions={"g": self.table.c.cents},
+            ) as batch_op:
+                batch_op.alter_column("a", type_=String(20))
+        context.assert_()
+
+    def test_computed_column_not_copied(self):
+        # generated columns can't be written to, so they are excluded
+        # from the INSERT ... SELECT
+        context = self._fixture()
+        self.table.append_column(
+            Column("g", Integer, Computed("cents * 2", persisted=True))
+        )
+        with self.op.batch_alter_table(
+            "foo", copy_from=self.table
+        ) as batch_op:
+            batch_op.alter_column("a", type_=String(20))
+        context.assert_(
+            "CREATE TABLE _alembic_tmp_foo (id INTEGER NOT NULL, "
+            "a VARCHAR(20), b INTEGER, cents INTEGER, "
+            "g INTEGER GENERATED ALWAYS AS (cents * 2) STORED, "
+            "PRIMARY KEY (id))",
+            "INSERT INTO _alembic_tmp_foo (id, a, b, cents) "
+            "SELECT foo.id, CAST(foo.a AS VARCHAR(20)) AS a, "
+            "foo.b, foo.cents FROM foo",
+            "DROP TABLE foo",
+            "ALTER TABLE _alembic_tmp_foo RENAME TO foo",
+        )
+
+
 class _BatchRoundTripBase:
     """common fixtures for the batch round trip tests.
 
@@ -2305,6 +2535,135 @@ class BatchRoundTripTest(_BatchRoundTripBase, TestBase):
             [col["name"] for col in inspect(connection).get_columns("foo")],
             ["id", "data", "x"],
         )
+
+    @testing.exclusions.only_on("sqlite")
+    def test_column_expression_rename_w_conversion(
+        self, metadata, connection
+    ):
+        t = Table(
+            "expr_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cents", Integer),
+        )
+        t.create(connection)
+        connection.execute(
+            t.insert(), [{"id": 1, "cents": 12345}, {"id": 2, "cents": 50}]
+        )
+
+        with self.op.batch_alter_table(
+            "expr_t",
+            column_expressions={"amount": t.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.alter_column(
+                "cents", new_column_name="amount", type_=Float
+            )
+
+        eq_(
+            connection.execute(
+                text("select id, amount from expr_t order by id")
+            ).all(),
+            [(1, 123.45), (2, 0.5)],
+        )
+        eq_(
+            [col["name"] for col in inspect(connection).get_columns("expr_t")],
+            ["id", "amount"],
+        )
+
+    @testing.exclusions.only_on("sqlite")
+    def test_column_expression_add_not_null_drop_source(
+        self, metadata, connection
+    ):
+        t = Table(
+            "expr_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cents", Integer),
+        )
+        t.create(connection)
+        connection.execute(
+            t.insert(), [{"id": 1, "cents": 12345}, {"id": 2, "cents": 50}]
+        )
+
+        with self.op.batch_alter_table(
+            "expr_t",
+            column_expressions={"amount": t.c.cents / 100.0},
+        ) as batch_op:
+            batch_op.add_column(Column("amount", Float, nullable=False))
+            batch_op.drop_column("cents")
+
+        eq_(
+            connection.execute(
+                text("select id, amount from expr_t order by id")
+            ).all(),
+            [(1, 123.45), (2, 0.5)],
+        )
+        eq_(
+            [col["name"] for col in inspect(connection).get_columns("expr_t")],
+            ["id", "amount"],
+        )
+
+    @testing.exclusions.only_on("sqlite")
+    def test_column_expression_swap_columns(self, metadata, connection):
+        t = Table(
+            "expr_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("a", Integer),
+            Column("b", Integer),
+        )
+        t.create(connection)
+        connection.execute(t.insert(), [{"id": 1, "a": 10, "b": 20}])
+
+        with self.op.batch_alter_table(
+            "expr_t",
+            column_expressions={"a": t.c.b, "b": t.c.a},
+        ) as batch_op:
+            pass
+
+        eq_(
+            connection.execute(text("select a, b from expr_t")).all(),
+            [(20, 10)],
+        )
+
+    @testing.exclusions.only_on("sqlite")
+    def test_column_expression_constraint_violation_preserves_table(
+        self, metadata, connection
+    ):
+        t = Table(
+            "expr_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cents", Integer),
+        )
+        t.create(connection)
+        connection.execute(t.insert(), [{"id": 1, "cents": 5}])
+
+        with expect_raises_message(
+            sqla_exc.IntegrityError, "CHECK constraint"
+        ):
+            with self.op.batch_alter_table(
+                "expr_t",
+                table_args=(
+                    CheckConstraint("amount > 100", name="ck_amount"),
+                ),
+                column_expressions={"amount": t.c.cents / 100.0},
+            ) as batch_op:
+                batch_op.add_column(Column("amount", Float, nullable=False))
+                batch_op.drop_column("cents")
+
+        # the existing table is untouched and the temp table is gone
+        eq_(
+            connection.execute(text("select id, cents from expr_t")).all(),
+            [(1, 5)],
+        )
+        eq_(
+            [col["name"] for col in inspect(connection).get_columns("expr_t")],
+            ["id", "cents"],
+        )
+        assert "_alembic_tmp_expr_t" not in inspect(
+            connection
+        ).get_table_names()
 
     def test_add_column_insert_before_recreate(self, connection):
         with self.op.batch_alter_table("foo", recreate="always") as batch_op:

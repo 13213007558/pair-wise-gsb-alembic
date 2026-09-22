@@ -100,6 +100,48 @@ The reflection process may also be bypassed entirely by sending a
 pre-fabricated :class:`~sqlalchemy.schema.Table` object; see
 :ref:`batch_offline_mode` for an example.
 
+.. _batch_column_expressions:
+
+Transforming Column Values During the Copy
+------------------------------------------
+
+When the "move and copy" procedure runs, data is transferred to the new
+table using ``INSERT ... SELECT``.  The
+:paramref:`~.Operations.batch_alter_table.column_expressions` argument
+allows SQLAlchemy expressions to be associated with individual target
+columns, so that the values for those columns are computed within that
+``SELECT`` rather than copied directly.  This accommodates migrations
+that need to change the *values* of column data as the table is
+rebuilt, such as converting a column of cents into a column of
+fractional amounts::
+
+    with op.batch_alter_table(
+        "order",
+        column_expressions={"amount": order_table.c.cents / 100.0},
+    ) as batch_op:
+        batch_op.add_column(sa.Column("amount", sa.Float(), nullable=False))
+        batch_op.drop_column("cents")
+
+The keys of the mapping name the columns of the **new** table, and each
+expression is evaluated against the table as it exists **before** the
+batch migration; column references are matched by name, so they remain
+valid even if the referenced columns are renamed or dropped within the
+same batch.  Expressions may be written against any
+:class:`~sqlalchemy.schema.Table` object with matching column names,
+or using free-standing :func:`~sqlalchemy.sql.expression.column`
+constructs.  Columns not named in the mapping are copied using the
+usual rules, and generated (computed) columns are never assigned a
+value.  Expressions may not refer to columns that are newly added
+within the same batch, as those values have not been computed yet.
+
+Passing :paramref:`~.Operations.batch_alter_table.column_expressions`
+forces the table to be recreated when
+:paramref:`~.Operations.batch_alter_table.recreate` is left at its
+default of ``"auto"``, and is incompatible with ``recreate="never"``.
+The expressions apply only to the migration being run; a downgrade that
+needs to restore the original values must declare its own expressions.
+
+
 .. _sqlite_batch_constraints:
 
 Dealing with Constraints

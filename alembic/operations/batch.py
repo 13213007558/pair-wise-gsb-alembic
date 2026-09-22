@@ -16,6 +16,8 @@ from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
 from sqlalchemy import types as sqltypes
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.elements import ColumnClause
 from sqlalchemy.sql.schema import SchemaEventTarget
 from sqlalchemy.util import OrderedDict
 from sqlalchemy.util import topological
@@ -42,8 +44,8 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.engine import Dialect
-    from sqlalchemy.sql.elements import ColumnClause
     from sqlalchemy.sql.elements import quoted_name
+    from sqlalchemy.sql.expression import ColumnElement
     from sqlalchemy.sql.schema import Constraint
     from sqlalchemy.sql.type_api import TypeEngine
 
@@ -65,6 +67,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        column_expressions,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +90,9 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        self.column_expressions = (
+            dict(column_expressions) if column_expressions else {}
+        )
         self.batch = []
 
     @property
@@ -99,7 +105,9 @@ class BatchOperationsImpl:
 
     def _should_recreate(self) -> bool:
         if self.recreate == "auto":
-            return self.operations.impl.requires_recreate_in_batch(self)
+            return bool(
+                self.column_expressions
+            ) or self.operations.impl.requires_recreate_in_batch(self)
         elif self.recreate == "always":
             return True
         else:
@@ -107,6 +115,15 @@ class BatchOperationsImpl:
 
     def flush(self) -> None:
         should_recreate = self._should_recreate()
+
+        if self.column_expressions and not should_recreate:
+            raise exc.CommandError(
+                "The 'column_expressions' argument to "
+                "batch_alter_table() requires that the table be "
+                "recreated using the 'move and copy' procedure; "
+                "recreate='never' is therefore not compatible with "
+                "this argument."
+            )
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
@@ -165,6 +182,7 @@ class BatchOperationsImpl:
                     self.table_kwargs,
                     reflected,
                     partial_reordering=self.partial_reordering,
+                    column_expressions=self.column_expressions,
                 )
                 for opname, arg, kw in self.batch:
                     fn = getattr(batch_impl, opname)
@@ -228,6 +246,7 @@ class ApplyBatchImpl:
         table_kwargs: dict[str, Any],
         reflected: bool,
         partial_reordering: tuple = (),
+        column_expressions: dict[str, ColumnElement[Any]] | None = None,
     ) -> None:
         self.impl = impl
         self.table = table  # this is a Table object
@@ -235,6 +254,9 @@ class ApplyBatchImpl:
         self.table_kwargs = table_kwargs
         self.temp_table_name = self._calc_temp_name(table.name)
         self.new_table: Table | None = None
+        self.column_expressions = (
+            dict(column_expressions) if column_expressions else {}
+        )
 
         self.partial_reordering = partial_reordering  # tuple of tuples
         self.add_col_ordering: tuple[
@@ -467,7 +489,89 @@ class ApplyBatchImpl:
                     schema=referent_schema,
                 )
 
+    def _adapt_column_expression(
+        self, target_name: str, expr: ColumnElement[Any]
+    ) -> ColumnElement[Any]:
+        """Rebind the column references in a user-supplied expression
+        to the columns of the *existing* table.
+
+        The expression is evaluated against the table as it exists
+        before the batch migration, regardless of any rename/drop
+        operations that will be applied to the new table.  Columns are
+        matched by name so that the expression may be written against
+        any Table object (or free-standing column clause) with
+        matching column names.
+
+        """
+        source_columns = self.table.c
+
+        def replace(obj: Any) -> Any:
+            if isinstance(obj, ColumnClause):
+                col_name = getattr(obj, "name", None)
+                if col_name is None:
+                    return None
+                try:
+                    return source_columns[col_name]
+                except KeyError:
+                    raise exc.CommandError(
+                        f"Column expression for column {target_name!r} "
+                        f"refers to column {col_name!r} which is not "
+                        "present in the existing table.  Column "
+                        "expressions may only refer to columns of the "
+                        "table as it exists before the batch migration "
+                        "and can't refer to columns that are newly "
+                        "added within the same batch."
+                    ) from None
+            return None
+
+        return visitors.replacement_traverse(expr, {}, replace)
+
+    def _apply_column_expressions(self) -> None:
+        """Apply user-supplied column expressions to the column
+        transfers, validating them before the new table is created.
+
+        """
+        if not self.column_expressions:
+            return
+
+        # target columns are named as they will appear in the new
+        # table; map those names back to the keys used by
+        # self.column_transfers, which remain the original keys even
+        # for renamed columns.
+        targets: dict[str, str] = {}
+        for key, col in self.columns.items():
+            targets.setdefault(col.name, key)
+
+        assigned: set[str] = set()
+        for name, expr in self.column_expressions.items():
+            try:
+                key = targets[name]
+            except KeyError:
+                raise exc.CommandError(
+                    f"Can't apply column expression for column "
+                    f"{name!r}; no such column will be present in the "
+                    "new table."
+                ) from None
+            if key in assigned:
+                raise exc.CommandError(
+                    f"Column {name!r} is assigned more than one "
+                    "column expression."
+                )
+            assigned.add(key)
+
+            if self.columns[key].computed is not None:
+                raise exc.CommandError(
+                    f"Can't apply column expression for column "
+                    f"{name!r}; the column is a generated column and "
+                    "can't be assigned a value."
+                )
+
+            self.column_transfers[key]["expr"] = (
+                self._adapt_column_expression(name, expr)
+            )
+
     def _create(self, op_impl: DefaultImpl) -> None:
+        self._apply_column_expressions()
         self._transfer_elements_to_new_table()
 
         op_impl.prep_table_for_batch(self, self.table)
@@ -483,12 +587,14 @@ class ApplyBatchImpl:
                         k
                         for k, transfer in self.column_transfers.items()
                         if "expr" in transfer
+                        and self.columns[k].computed is None
                     ),
                     select(
                         *[
                             transfer["expr"]
-                            for transfer in self.column_transfers.values()
+                            for k, transfer in self.column_transfers.items()
                             if "expr" in transfer
+                            and self.columns[k].computed is None
                         ]
                     ),
                 )
