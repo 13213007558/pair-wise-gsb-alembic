@@ -249,6 +249,8 @@ class AbstractOperations(util.ModuleClsProxy):
         reflect_args: tuple[Any, ...] = (),
         reflect_kwargs: Mapping[str, Any] = util.immutabledict(),
         naming_convention: dict[str, str] | None = None,
+        preserve_triggers: bool = False,
+        exclude_triggers: Sequence[str] = (),
     ) -> Iterator[BatchOperations]:
         """Invoke a series of per-table migrations in batch.
 
@@ -379,6 +381,42 @@ class AbstractOperations(util.ModuleClsProxy):
          set is undefined.   Therefore it is best to specify the complete
          ordering of all columns for best results.
 
+        :param preserve_triggers: when True, SQL triggers associated with
+         the target table (SQLite only) are preserved across the
+         "move and copy" process.  Trigger definitions are read verbatim
+         from ``sqlite_master`` before the existing table is dropped,
+         and are replayed verbatim after the new table is renamed back to
+         the original name, so the historical data copy does not fire any
+         trigger logic and subsequent INSERT / UPDATE / DELETE statements
+         behave exactly as they did before the migration.
+
+         The mode is limited to batch operations that leave the table
+         name and all column names unchanged; column renames and table
+         renames are rejected.  If the batch drops a column that is
+         referenced by an existing trigger, the operation fails before
+         the original table is touched, unless that trigger is explicitly
+         listed in
+         :paramref:`~.Operations.batch_alter_table.exclude_triggers`.
+
+         Trigger preservation requires a live database connection in
+         order to reflect the existing trigger definitions; it is not
+         available in offline ``--sql`` mode, including when
+         :paramref:`~.Operations.batch_alter_table.copy_from` is used,
+         since a :class:`~sqlalchemy.schema.Table` object does not carry
+         trigger definitions.
+
+         .. seealso::
+
+            :ref:`batch_preserving_triggers`
+
+        :param exclude_triggers: a collection of trigger names that are
+         exempt from preservation when
+         :paramref:`~.Operations.batch_alter_table.preserve_triggers` is
+         enabled; the named triggers are dropped along with the original
+         table and are not restored.  This is the explicit opt-out to use
+         when a batch operation intentionally removes something a trigger
+         depends upon, such as a dropped column.
+
         .. note:: batch mode requires SQLAlchemy 0.8 or above.
 
         .. seealso::
@@ -398,6 +436,8 @@ class AbstractOperations(util.ModuleClsProxy):
             reflect_kwargs,
             naming_convention,
             partial_reordering,
+            preserve_triggers,
+            exclude_triggers,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
         yield batch_op

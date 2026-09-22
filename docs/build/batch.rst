@@ -285,6 +285,59 @@ by a batch migration.  Therefore it may be necessary to manipulate the
 ``PRAGMA FOREIGN KEYS`` setting if a migration seeks to rename a table vs.
 batch migrate it.
 
+.. _batch_preserving_triggers:
+
+Preserving Triggers (SQLite)
+----------------------------
+
+When "move and copy" proceeds on SQLite, dropping the existing table also
+drops every trigger that is associated with it, and the batch process does
+not recreate them.  For tables that carry auditing or other housekeeping
+triggers, the :paramref:`~.Operations.batch_alter_table.preserve_triggers`
+flag opts into preserving those triggers across the migration::
+
+    with op.batch_alter_table(
+        "some_table", preserve_triggers=True
+    ) as batch_op:
+        batch_op.alter_column("bar", type_=Integer)
+
+With the flag enabled, the ``CREATE TRIGGER`` statements associated with
+the table are read verbatim from ``sqlite_master`` before the existing
+table is dropped, and are replayed verbatim once the new table has been
+renamed back to the original name.  The recorded statement text is never
+parsed, split, or rewritten, so trigger bodies that contain semicolons,
+comments, quoted identifiers, or multiple statements round-trip exactly.
+Triggers that live in an attached database are handled separately per
+database, using the same ``schema=`` argument that selects the table.
+
+Because triggers are only restored after the new table is in place, the
+"INSERT from SELECT" that copies historical data does not fire any
+trigger logic; INSERT, UPDATE, and DELETE statements issued after the
+migration observe the original trigger behavior.
+
+The mode is deliberately limited to batch operations that leave the table
+name and all column names unchanged; column renames and table renames are
+rejected up front.  Additionally, if the batch drops a column that an
+existing trigger references, the operation fails **before** the original
+table is touched.  To intentionally drop such a trigger along with the
+table, list its name in
+:paramref:`~.Operations.batch_alter_table.exclude_triggers`::
+
+    with op.batch_alter_table(
+        "some_table",
+        preserve_triggers=True,
+        exclude_triggers=("some_table_audit_trg",),
+    ) as batch_op:
+        batch_op.drop_column("bar")
+
+Trigger preservation requires reflecting the existing trigger definitions
+from the live database, so it is only available in "online" mode.  Offline
+``--sql`` generation is not supported, including when
+:paramref:`~.Operations.batch_alter_table.copy_from` is used, because a
+:class:`~sqlalchemy.schema.Table` object does not carry trigger
+definitions; passing ``preserve_triggers=True`` in that context raises
+an error.
+
 .. _batch_offline_mode:
 
 Working in Offline Mode

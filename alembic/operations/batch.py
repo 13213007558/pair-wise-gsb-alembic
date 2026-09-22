@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ from sqlalchemy import PrimaryKeyConstraint
 from sqlalchemy import schema as sql_schema
 from sqlalchemy import select
 from sqlalchemy import Table
+from sqlalchemy import text
 from sqlalchemy import types as sqltypes
 from sqlalchemy.sql.schema import SchemaEventTarget
 from sqlalchemy.util import OrderedDict
@@ -65,6 +67,8 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        preserve_triggers,
+        exclude_triggers,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +91,8 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        self.preserve_triggers = preserve_triggers
+        self.exclude_triggers = tuple(exclude_triggers)
         self.batch = []
 
     @property
@@ -110,10 +116,22 @@ class BatchOperationsImpl:
 
         with _ensure_scope_for_ddl(self.impl.connection):
             if not should_recreate:
+                if self.preserve_triggers:
+                    util.warn(
+                        "preserve_triggers=True has no effect for this "
+                        "batch operation; the table was not recreated, so "
+                        "existing triggers were never dropped."
+                    )
                 for opname, arg, kw in self.batch:
                     fn = getattr(self.operations.impl, opname)
                     fn(*arg, **kw)
             else:
+                triggers_to_restore = None
+                if self.preserve_triggers:
+                    triggers_to_restore = (
+                        self._reflect_triggers_for_preservation()
+                    )
+
                 m1 = MetaData()
 
                 if self.copy_from is not None:
@@ -171,6 +189,140 @@ class BatchOperationsImpl:
                     fn(*arg, **kw)
 
                 batch_impl._create(self.impl)
+
+                if triggers_to_restore:
+                    self._restore_triggers(triggers_to_restore)
+
+    def _reflect_triggers_for_preservation(self):
+        if self.operations.migration_context.as_sql:
+            raise exc.CommandError(
+                "preserve_triggers=True requires a live database "
+                "connection; trigger definitions are reflected from "
+                "sqlite_master before the table is recreated.  Offline "
+                "--sql generation is not supported for trigger "
+                "preservation, including when the copy_from parameter is "
+                "used, because a Table object does not carry trigger "
+                "definitions."
+            )
+        self._check_trigger_preservation_scope()
+        triggers = self._reflect_triggers()
+        self._check_trigger_column_dependencies(triggers)
+        return triggers
+
+    def _check_trigger_preservation_scope(self) -> None:
+        for opname, arg, kw in self.batch:
+            if opname == "rename_table":
+                raise exc.CommandError(
+                    "preserve_triggers=True only supports batch operations "
+                    "that leave the table name unchanged; rename_table() "
+                    "is not supported."
+                )
+            elif opname == "alter_column":
+                new_name = kw.get("name", None)
+                if new_name is not None and new_name != arg[1]:
+                    raise exc.CommandError(
+                        "preserve_triggers=True only supports batch "
+                        "operations that leave column names unchanged; "
+                        "column '%s' may not be renamed to '%s' while "
+                        "trigger preservation is enabled."
+                        % (arg[1], new_name)
+                    )
+
+    def _reflect_triggers(self):
+        connection = self.operations.get_bind()
+        preparer = self.dialect.identifier_preparer
+        if self.schema:
+            sqlite_master = "%s.sqlite_master" % preparer.quote_schema(
+                self.schema
+            )
+        else:
+            sqlite_master = "sqlite_master"
+        rows = connection.execute(
+            text(
+                "SELECT name, sql FROM %s "
+                "WHERE type = 'trigger' AND tbl_name = :tbl_name "
+                "ORDER BY name" % sqlite_master
+            ),
+            {"tbl_name": self.table_name},
+        )
+        excluded = set(self.exclude_triggers)
+        return [
+            (name, sql)
+            for name, sql in rows
+            if sql is not None and name not in excluded
+        ]
+
+    def _check_trigger_column_dependencies(self, triggers) -> None:
+        dropped_columns = [
+            getattr(arg[1], "name", arg[1])
+            for opname, arg, kw in self.batch
+            if opname == "drop_column"
+        ]
+        if not dropped_columns:
+            return
+        problems = []
+        for trig_name, trig_sql in triggers:
+            for colname in dropped_columns:
+                if re.search(
+                    r"(?<![\w$])%s(?![\w$])" % re.escape(colname),
+                    trig_sql,
+                    re.IGNORECASE,
+                ):
+                    problems.append((trig_name, colname))
+        if problems:
+            raise exc.CommandError(
+                "preserve_triggers=True cannot proceed: the batch "
+                "operation drops column(s) that are referenced by "
+                "existing trigger(s): "
+                + ", ".join(
+                    "trigger '%s' references column '%s'" % (trig, col)
+                    for trig, col in problems
+                )
+                + ".  Restoring the trigger(s) after the table is "
+                "recreated would fail.  To proceed, pass the trigger "
+                "name(s) in the exclude_triggers parameter of "
+                "batch_alter_table(), accepting that the excluded "
+                "trigger(s) will be permanently dropped."
+            )
+
+    def _restore_triggers(self, triggers) -> None:
+        # the CREATE TRIGGER statements are replayed verbatim as they
+        # were recorded in sqlite_master; the statement text is not
+        # parsed, split, or rewritten in any way, so bodies containing
+        # semicolons, comments, quoted identifiers, or multiple
+        # statements are preserved exactly.  For triggers that live in
+        # an attached database, the trigger name in the recorded
+        # statement header is re-qualified with the schema name if the
+        # SQLite version in use stored it without one; the statement
+        # body is still replayed exactly as recorded.
+        for trig_name, trig_sql in triggers:
+            self.impl._exec(self._schema_qualify_trigger_sql(trig_sql))
+
+    def _schema_qualify_trigger_sql(self, trig_sql: str) -> str:
+        if not self.schema:
+            return trig_sql
+        m = re.match(
+            r"\s*CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+            trig_sql,
+            re.IGNORECASE,
+        )
+        if not m:
+            # not a form we recognize; replay verbatim and let the
+            # database report any error
+            return trig_sql
+        remainder = trig_sql[m.end() :]
+        ident = re.match(
+            r'"(?:[^"]|"")*"|\[[^\]]*\]|\x60[^\x60]*\x60|\w+', remainder
+        )
+        if ident and remainder[ident.end() :].lstrip().startswith("."):
+            # trigger name is already schema-qualified, as recorded by
+            # SQLite versions that store the original statement verbatim
+            return trig_sql
+        return "%s%s.%s" % (
+            trig_sql[: m.end()],
+            self.dialect.identifier_preparer.quote_schema(self.schema),
+            remainder,
+        )
 
     def alter_column(self, *arg, **kw) -> None:
         self.batch.append(("alter_column", arg, kw))

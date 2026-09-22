@@ -2,10 +2,12 @@ from contextlib import contextmanager
 import random
 import re
 
+from sqlalchemy import BigInteger
 from sqlalchemy import Boolean
 from sqlalchemy import CheckConstraint
 from sqlalchemy import Column
 from sqlalchemy import Computed
+from sqlalchemy import create_engine
 from sqlalchemy import DateTime
 from sqlalchemy import Enum
 from sqlalchemy import exc as sqla_exc
@@ -48,6 +50,7 @@ from alembic.testing import is_
 from alembic.testing import mock
 from alembic.testing import TestBase
 from alembic.testing.env import _no_sql_testing_config
+from alembic.testing.env import _sqlite_testing_config
 from alembic.testing.env import clear_staging_env
 from alembic.testing.env import staging_env
 from alembic.testing.env import write_script
@@ -2898,6 +2901,371 @@ class BatchUnnamedCheckConstraintTest(_BatchRoundTripBase, TestBase):
             batch_op.add_column(Column("y", Integer))
 
         eq_(self._check_constraints(connection), [(None, "x > 5")])
+
+
+class BatchPreserveTriggersTest(_BatchRoundTripBase, TestBase):
+    __only_on__ = "sqlite"
+
+    INSERT_TRIGGER = (
+        "CREATE TRIGGER item_ai AFTER INSERT ON item BEGIN\n"
+        "    INSERT INTO audit_log(action, detail) "
+        "VALUES ('insert;semi', NEW.name); -- a comment; with semicolon\n"
+        "    INSERT INTO audit_log(action, detail) "
+        "VALUES ('it''s \"quoted\"', NEW.qty);\n"
+        "END"
+    )
+    UPDATE_TRIGGER = (
+        "CREATE TRIGGER item_au AFTER UPDATE OF qty ON item BEGIN\n"
+        "    INSERT INTO audit_log(action, detail) "
+        "VALUES ('update', OLD.name);\n"
+        "END"
+    )
+    DELETE_TRIGGER = (
+        "CREATE TRIGGER item_ad AFTER DELETE ON item BEGIN\n"
+        "    INSERT INTO audit_log(action, detail) "
+        "VALUES ('delete', OLD.name);\n"
+        "END"
+    )
+
+    @testing.fixture(autouse=True)
+    def _audit_fixture(self, metadata, connection):
+        item = Table(
+            "item",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("name", String(50)),
+            Column("qty", Integer),
+        )
+        audit_log = Table(
+            "audit_log",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("action", String(20)),
+            Column("detail", String(50)),
+        )
+        with connection.begin():
+            item.create(connection)
+            audit_log.create(connection)
+            for trigger_sql in (
+                self.INSERT_TRIGGER,
+                self.UPDATE_TRIGGER,
+                self.DELETE_TRIGGER,
+            ):
+                connection.exec_driver_sql(trigger_sql)
+            connection.execute(
+                item.insert(),
+                [
+                    {"id": 1, "name": "apple", "qty": 5},
+                    {"id": 2, "name": "banana", "qty": 6},
+                ],
+            )
+        self.item = item
+        self.audit_log = audit_log
+
+    def _reflected_triggers(self, connection, schema=None):
+        source = (
+            "sqlite_master" if schema is None else "%s.sqlite_master" % schema
+        )
+        return {
+            name: sql
+            for name, sql in connection.execute(
+                text(
+                    "SELECT name, sql FROM %s "
+                    "WHERE type = 'trigger' ORDER BY name" % source
+                )
+            )
+        }
+
+    def _audit_rows(self, connection):
+        return connection.execute(
+            select(self.audit_log.c.action, self.audit_log.c.detail)
+        ).all()
+
+    def test_triggers_preserved_verbatim(self, connection):
+        triggers_before = self._reflected_triggers(connection)
+        eq_(len(triggers_before), 3)
+        # two inserts fired the INSERT trigger, which writes two rows each
+        eq_(len(self._audit_rows(connection)), 4)
+
+        with self.op.batch_alter_table(
+            "item", preserve_triggers=True
+        ) as batch_op:
+            batch_op.alter_column("qty", type_=BigInteger)
+
+        # trigger definitions round-trip exactly as recorded
+        eq_(self._reflected_triggers(connection), triggers_before)
+
+        # the historical data copy did not fire any audit logic
+        eq_(len(self._audit_rows(connection)), 4)
+
+        # historical data was copied
+        eq_(
+            connection.execute(
+                select(self.item.c.id, self.item.c.name, self.item.c.qty)
+            ).all(),
+            [(1, "apple", 5), (2, "banana", 6)],
+        )
+
+        # post-migration INSERT / UPDATE / DELETE fire the triggers
+        connection.execute(
+            self.item.insert(),
+            [{"id": 3, "name": "cherry", "qty": 7}],
+        )
+        connection.execute(
+            self.item.update().where(self.item.c.id == 3).values(qty=8)
+        )
+        connection.execute(self.item.delete().where(self.item.c.id == 3))
+        eq_(
+            self._audit_rows(connection)[4:],
+            [
+                ("insert;semi", "cherry"),
+                ("it's \"quoted\"", "7"),
+                ("update", "cherry"),
+                ("delete", "cherry"),
+            ],
+        )
+
+    def test_no_recreate_no_effect(self, connection):
+        with expect_warnings(
+            "preserve_triggers=True has no effect for this batch operation"
+        ):
+            with self.op.batch_alter_table(
+                "item", preserve_triggers=True
+            ) as batch_op:
+                batch_op.add_column(Column("extra", Integer))
+        eq_(len(self._reflected_triggers(connection)), 3)
+
+    def test_drop_column_referenced_by_trigger_refused(self, connection):
+        with expect_raises_message(
+            CommandError,
+            "preserve_triggers=True cannot proceed",
+        ):
+            with self.op.batch_alter_table(
+                "item", preserve_triggers=True
+            ) as batch_op:
+                batch_op.drop_column("qty")
+
+        # the original table and its triggers were not touched
+        eq_(
+            [row[1] for row in connection.exec_driver_sql(
+                "PRAGMA table_info(item)"
+            )],
+            ["id", "name", "qty"],
+        )
+        eq_(len(self._reflected_triggers(connection)), 3)
+
+    def test_exclude_triggers_allows_column_drop(self, connection):
+        with self.op.batch_alter_table(
+            "item",
+            preserve_triggers=True,
+            exclude_triggers=("item_ai", "item_au"),
+        ) as batch_op:
+            batch_op.drop_column("qty")
+
+        eq_(
+            list(self._reflected_triggers(connection)),
+            ["item_ad"],
+        )
+        eq_(
+            connection.execute(
+                select(self.item.c.id, self.item.c.name)
+            ).all(),
+            [(1, "apple"), (2, "banana")],
+        )
+
+    def test_column_rename_refused(self, connection):
+        with expect_raises_message(
+            CommandError,
+            "leave column names unchanged",
+        ):
+            with self.op.batch_alter_table(
+                "item", preserve_triggers=True
+            ) as batch_op:
+                batch_op.alter_column("name", new_column_name="item_name")
+        eq_(len(self._reflected_triggers(connection)), 3)
+
+    def test_offline_mode_not_supported(self):
+        m = MetaData()
+        t = Table(
+            "item",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("qty", Integer),
+        )
+        context = op_fixture(dialect="sqlite", as_sql=True)
+        op = Operations(context)
+        with expect_raises_message(
+            CommandError,
+            "preserve_triggers=True requires a live database connection",
+        ):
+            with op.batch_alter_table(
+                "item", copy_from=t, preserve_triggers=True
+            ) as batch_op:
+                batch_op.drop_column("qty")
+
+    @testing.fixture
+    def aux_database(self, connection, tmp_path):
+        aux_path = tmp_path / "aux.db"
+        connection.exec_driver_sql(
+            "ATTACH DATABASE '%s' AS aux" % aux_path
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE aux.item (id INTEGER PRIMARY KEY, "
+            "name VARCHAR(50), qty INTEGER)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE aux.audit_log (id INTEGER PRIMARY KEY, "
+            "action VARCHAR(20), detail VARCHAR(50))"
+        )
+        connection.exec_driver_sql(
+            "CREATE TRIGGER aux.item_ai AFTER INSERT ON aux.item BEGIN "
+            "INSERT INTO audit_log(action, detail) "
+            "VALUES ('aux-insert', NEW.name); END"
+        )
+        try:
+            yield
+        finally:
+            _safe_commit_connection_transaction(connection)
+            connection.exec_driver_sql("DETACH DATABASE aux")
+
+    def test_attached_database_triggers_are_isolated(
+        self, connection, aux_database
+    ):
+        # same table name and trigger name exist in the attached
+        # database; a batch migration on the main table must not
+        # disturb them
+        with self.op.batch_alter_table(
+            "item", preserve_triggers=True
+        ) as batch_op:
+            batch_op.alter_column("qty", type_=BigInteger)
+
+        eq_(
+            self._reflected_triggers(connection, schema="aux"),
+            {
+                "item_ai": "CREATE TRIGGER item_ai AFTER INSERT ON "
+                "aux.item BEGIN INSERT INTO audit_log(action, detail) "
+                "VALUES ('aux-insert', NEW.name); END"
+            },
+        )
+        eq_(len(self._reflected_triggers(connection)), 3)
+
+        connection.exec_driver_sql(
+            "INSERT INTO aux.item (id, name, qty) VALUES (1, 'a', 1)"
+        )
+        eq_(
+            connection.execute(
+                text("SELECT action, detail FROM aux.audit_log")
+            ).all(),
+            [("aux-insert", "a")],
+        )
+
+    def test_attached_database_schema_batch(
+        self, connection, aux_database
+    ):
+        # running the batch against the attached database preserves the
+        # attached database's trigger and leaves the main database's
+        # triggers alone
+        with self.op.batch_alter_table(
+            "item", schema="aux", preserve_triggers=True
+        ) as batch_op:
+            batch_op.alter_column("qty", type_=BigInteger)
+
+        eq_(
+            list(self._reflected_triggers(connection, schema="aux")),
+            ["item_ai"],
+        )
+        eq_(len(self._reflected_triggers(connection)), 3)
+
+        connection.exec_driver_sql(
+            "INSERT INTO aux.item (id, name, qty) VALUES (2, 'b', 2)"
+        )
+        eq_(
+            connection.execute(
+                text("SELECT action, detail FROM aux.audit_log")
+            ).all(),
+            [("aux-insert", "b")],
+        )
+
+
+class BatchPreserveTriggersCommandTest(TestBase):
+    __only_on__ = "sqlite"
+
+    def setUp(self):
+        self.env = staging_env()
+        self.cfg = _sqlite_testing_config()
+
+    def tearDown(self):
+        clear_staging_env()
+
+    def _make_audit_schema(self):
+        eng = create_engine(self.cfg.get_main_option("sqlalchemy.url"))
+        with eng.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE item (id INTEGER PRIMARY KEY, "
+                "name VARCHAR(50), qty INTEGER)"
+            )
+            conn.exec_driver_sql(
+                "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, "
+                "action VARCHAR(20), detail VARCHAR(50))"
+            )
+            conn.exec_driver_sql(
+                "CREATE TRIGGER item_ai AFTER INSERT ON item BEGIN "
+                "INSERT INTO audit_log(action, detail) "
+                "VALUES ('insert', NEW.name); END"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO item (id, name, qty) VALUES (1, 'a', 5)"
+            )
+        return eng
+
+    def test_restore_failure_does_not_update_alembic_version(self):
+        eng = self._make_audit_schema()
+        a = util.rev_id()
+        script = ScriptDirectory.from_config(self.cfg)
+        script.generate_revision(a, "revision a", refresh=True, head="base")
+        write_script(
+            script,
+            a,
+            """\
+    "Rev A"
+    revision = '%s'
+    down_revision = None
+
+    from alembic import op
+    import sqlalchemy as sa
+
+    def upgrade():
+        # a decoy trigger with the same (database-global) name makes
+        # the trigger restoration fail after the move-and-copy has
+        # completed
+        op.execute("CREATE TABLE decoy (id INTEGER)")
+        op.execute(
+            "CREATE TRIGGER item_ai AFTER INSERT ON decoy "
+            "BEGIN SELECT 1; END"
+        )
+        with op.batch_alter_table("item", preserve_triggers=True) as batch_op:
+            batch_op.alter_column("qty", type_=sa.BigInteger())
+
+    def downgrade():
+        pass
+
+    """ % a,
+        )
+
+        # the restoration failure propagates out of the migration
+        with expect_raises_message(
+            sqla_exc.OperationalError, "trigger item_ai already exists"
+        ):
+            command.upgrade(self.cfg, "head")
+
+        # alembic_version was not updated to declare success
+        with eng.connect() as conn:
+            eq_(
+                conn.exec_driver_sql(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchall(),
+                [],
+            )
 
 
 class OfflineTest(TestBase):
