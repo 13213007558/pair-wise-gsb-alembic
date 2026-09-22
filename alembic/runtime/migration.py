@@ -25,6 +25,7 @@ from typing_extensions import ContextManager
 
 from .. import ddl
 from .. import util
+from . import checksum as _checksum
 from ..util import sqla_compat
 from ..util.compat import EncodedIO
 
@@ -142,6 +143,9 @@ class MigrationContext:
         )
         self.on_version_apply_callbacks = opts.get("on_version_apply", ())
         self._transaction: Transaction | None = None
+        self.verify_revision_checksums = opts.get(
+            "verify_revision_checksums", False
+        )
 
         if as_sql:
             self.connection = cast(
@@ -561,6 +565,48 @@ class MigrationContext:
         for step in script_directory._stamp_revs(revision, heads):
             head_maintainer.update_to_step(step)
 
+    def adopt_checksums(self) -> None:
+        """Record content checksums for all revisions currently applied
+        to the database.
+
+        This is the explicit, first-time adoption entry point for the
+        optional revision checksum verification feature (see the
+        `verify_revision_checksums` parameter of
+        :meth:`.EnvironmentContext.configure`).  Databases that were
+        migrated before the feature was enabled have no recorded
+        checksum history; calling this method records checksums for the
+        full closure of revisions that are currently applied, including
+        all ancestors of multiple heads, merge revisions and revisions
+        linked via `depends_on`.
+
+        The adoption is refused, leaving any previously recorded
+        checksums untouched, if a revision is missing from the script
+        directory, a script file is missing, or the revision graph is
+        incomplete.
+
+        """
+        if self.as_sql:
+            raise util.CommandError(
+                "Checksum adoption is not supported in --sql mode"
+            )
+        store = _checksum.RevisionChecksumStore(self)
+        with self.begin_transaction(_per_migration=True):
+            store.adopt(self.get_current_heads())
+
+    def _update_checksums(
+        self,
+        checksum_store: _checksum.RevisionChecksumStore,
+        step: MigrationStep,
+        head_maintainer: HeadMaintainer,
+    ) -> None:
+        if isinstance(step, RevisionStep):
+            if step.is_upgrade:
+                checksum_store.record_script(step.revision)
+            else:
+                checksum_store.discard(step.revision.revision)
+        elif isinstance(step, StampStep):
+            checksum_store.adopt(tuple(head_maintainer.heads))
+
     def run_migrations(self, **kw: Any) -> None:
         r"""Run the migration scripts established for this
         :class:`.MigrationContext`, if any.
@@ -585,6 +631,7 @@ class MigrationContext:
         self.impl.start_migrations()
 
         heads: tuple[str, ...]
+        dont_mutate = self.opts.get("dont_mutate", False)
         if self.purge:
             if self.as_sql:
                 raise util.CommandError("Can't use --purge with --sql mode")
@@ -593,12 +640,15 @@ class MigrationContext:
         else:
             heads = self.get_current_heads()
 
-            dont_mutate = self.opts.get("dont_mutate", False)
-
             if not self.as_sql and not heads and not dont_mutate:
                 self._ensure_version_table()
 
         head_maintainer = HeadMaintainer(self, heads)
+
+        checksum_store: _checksum.RevisionChecksumStore | None = None
+        if self.verify_revision_checksums and not self.as_sql:
+            checksum_store = _checksum.RevisionChecksumStore(self)
+            checksum_store.verify()
 
         assert self._migrations_fn is not None
         for step in self._migrations_fn(heads, self):
@@ -621,6 +671,10 @@ class MigrationContext:
                 # and row-targeted updates and deletes, it's simpler for now
                 # just to run the operations on every version
                 head_maintainer.update_to_step(step)
+                if checksum_store is not None and not dont_mutate:
+                    self._update_checksums(
+                        checksum_store, step, head_maintainer
+                    )
                 for callback in self.on_version_apply_callbacks:
                     callback(
                         ctx=self,

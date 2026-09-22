@@ -850,3 +850,39 @@ def ensure_version(config: Config, sql: bool = False) -> None:
         as_sql=sql,
     ):
         script.run_env()
+
+
+def adopt_checksums(config: Config) -> None:
+    """Record content checksums for the revisions currently applied
+    to the database.
+
+    This is the explicit, first-time adoption entry point for the
+    optional revision checksum verification feature (see the
+    ``verify_revision_checksums`` parameter of
+    :meth:`.EnvironmentContext.configure`).  Databases that were
+    migrated before the feature was enabled have no recorded checksum
+    history; this command records checksums for the full closure of
+    revisions that are currently applied, including all ancestors of
+    multiple heads, merge revisions and revisions linked via
+    ``depends_on``.
+
+    The adoption is refused, leaving any previously recorded checksums
+    untouched, if a revision is missing from the script directory, a
+    script file is missing, or the revision graph is incomplete.
+
+    :param config: a :class:`.Config` instance.
+
+    """
+
+    script = ScriptDirectory.from_config(config)
+
+    def do_adopt_checksums(rev, context):
+        context.adopt_checksums()
+        return []
+
+    with EnvironmentContext(
+        config,
+        script,
+        fn=do_adopt_checksums,
+    ):
+        script.run_env()

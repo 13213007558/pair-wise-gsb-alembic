@@ -440,6 +440,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         user_module_prefix: str | None = None,
         on_version_apply: OnVersionApplyFn | None = None,
         autogenerate_plugins: Sequence[str] | None = None,
+        verify_revision_checksums: bool = False,
         **kw: Any,
     ) -> None:
         """Configure a :class:`.MigrationContext` within this
@@ -554,6 +555,22 @@ class EnvironmentContext(util.ModuleClsProxy):
             * ``heads``: a collection of version strings representing the
               current heads,
             * ``run_args``: the ``**kwargs`` passed to :meth:`.run_migrations`.
+
+        :param verify_revision_checksums: if True, enable optional
+         content checksum tracking for applied migration scripts.
+         Before any ``upgrade()`` or ``downgrade()`` function is
+         invoked, the checksums recorded for previously applied
+         revisions are verified against the current script files; a
+         mismatch stops the operation with an error naming the revision
+         and file involved, and recorded checksums are never overwritten
+         automatically.  After a revision is applied successfully its
+         checksum is recorded, and when a downgrade succeeds its record
+         is removed.  Databases that already have applied revisions but
+         no recorded checksum history can establish one explicitly using
+         :meth:`.MigrationContext.adopt_checksums` or the
+         ``adopt_checksums`` command.
+
+         .. versionadded:: 1.18
 
         Parameters specific to the autogenerate feature, when
         ``alembic revision`` is run with the ``--autogenerate`` feature:
@@ -923,6 +940,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["literal_binds"] = literal_binds
         opts["process_revision_directives"] = process_revision_directives
         opts["on_version_apply"] = util.to_tuple(on_version_apply, default=())
+        opts["verify_revision_checksums"] = verify_revision_checksums
 
         if autogenerate_plugins is not None:
             opts["autogenerate_plugins"] = autogenerate_plugins

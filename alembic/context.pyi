@@ -205,6 +205,7 @@ def configure(
         | None
     ) = None,
     autogenerate_plugins: Sequence[str] | None = None,
+    verify_revision_checksums: bool = False,
     **kw: Any,
 ) -> None:
     """Configure a :class:`.MigrationContext` within this

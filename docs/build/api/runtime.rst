@@ -38,3 +38,14 @@ not exposed to the end-user, except when the
 
 .. automodule:: alembic.runtime.migration
     :members: MigrationContext
+
+Revision Checksums
+==================
+
+The :mod:`alembic.runtime.checksum` module implements the optional
+content checksum tracking and verification feature enabled by the
+:paramref:`~.EnvironmentContext.configure.verify_revision_checksums`
+parameter.
+
+.. automodule:: alembic.runtime.checksum
+    :members:
