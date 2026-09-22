@@ -1454,6 +1454,19 @@ class RenameTableOp(AlterTableOp):
         super().__init__(old_table_name, schema=schema)
         self.new_table_name = new_table_name
 
+    def reverse(self) -> RenameTableOp:
+        return RenameTableOp(
+            self.new_table_name, self.table_name, schema=self.schema
+        )
+
+    def to_diff_tuple(self) -> tuple[Any, ...]:
+        return (
+            "rename_table",
+            self.schema,
+            self.table_name,
+            self.new_table_name,
+        )
+
     @classmethod
     def rename_table(
         cls,
@@ -1714,6 +1727,25 @@ class AlterColumnOp(AlterTableOp):
         col_diff = []
         schema, tname, cname = self.schema, self.table_name, self.column_name
 
+        if self.modify_name is not None:
+            col_diff.append(
+                (
+                    "modify_name",
+                    schema,
+                    tname,
+                    cname,
+                    {
+                        "existing_nullable": self.existing_nullable,
+                        "existing_server_default": (
+                            self.existing_server_default
+                        ),
+                        "existing_type": self.existing_type,
+                        "existing_comment": self.existing_comment,
+                    },
+                    self.modify_name,
+                )
+            )
+
         if self.modify_type is not None:
             col_diff.append(
                 (
@@ -1796,6 +1828,7 @@ class AlterColumnOp(AlterTableOp):
             or self.modify_server_default is not False
             or self.modify_type is not None
             or self.modify_comment is not False
+            or self.modify_name is not None
         )
         if hc1:
             return True
@@ -1833,8 +1866,13 @@ class AlterColumnOp(AlterTableOp):
                 kw["existing_%s" % k] = kw["modify_%s" % k]
                 kw["modify_%s" % k] = swap
 
+        column_name = self.column_name
+        if self.modify_name is not None:
+            kw["modify_name"] = self.column_name
+            column_name = self.modify_name
+
         return self.__class__(
-            self.table_name, self.column_name, schema=self.schema, **kw
+            self.table_name, column_name, schema=self.schema, **kw
         )
 
     @classmethod
