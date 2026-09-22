@@ -432,6 +432,7 @@ class EnvironmentContext(util.ModuleClsProxy):
         compare_type: bool | CompareType = True,
         compare_server_default: bool | CompareServerDefault = False,
         render_item: RenderItemFn | None = None,
+        column_renames: Any = None,
         literal_binds: bool = False,
         upgrade_token: str = "upgrades",
         downgrade_token: str = "downgrades",
@@ -627,6 +628,34 @@ class EnvironmentContext(util.ModuleClsProxy):
          .. seealso::
 
             :paramref:`.EnvironmentContext.configure.compare_type`
+
+        :param column_renames: optional, explicit mapping of column renames
+         to be applied during autogenerate.  This allows a rename such as
+         ``customer.full_name`` to ``customer.display_name`` to be
+         rendered as ``op.alter_column(..., new_column_name=...)`` instead
+         of a drop/add column pair.
+
+         The mapping is keyed by ``(schema, table_name, old_name)`` tuples
+         (or ``(table_name, old_name)`` for the default schema) with the
+         new column name as the value, e.g.::
+
+            context.configure(
+                # ...
+                column_renames={
+                    (None, "customer", "full_name"): "display_name",
+                }
+            )
+
+         Only columns named explicitly in the mapping are treated as
+         renames; no name-similarity guessing is performed.  All other
+         structures, including types, nullability, indexes, constraints
+         and foreign keys that refer to renamed columns, continue to be
+         compared normally.  Invalid mappings, such as renames whose
+         source column does not exist, whose target name is occupied by
+         an unrelated column, or that form cycles, raise an error before
+         the migration is generated.
+
+         .. versionadded:: 1.21
 
         :param include_name: A callable function which is given
          the chance to return ``True`` or ``False`` for any database reflected
@@ -932,6 +961,8 @@ class EnvironmentContext(util.ModuleClsProxy):
         opts["compare_type"] = compare_type
         if compare_server_default is not None:
             opts["compare_server_default"] = compare_server_default
+        if column_renames is not None:
+            opts["column_renames"] = column_renames
         opts["script"] = self.script
 
         opts.update(kw)

@@ -747,7 +747,60 @@ local model environment.  A return value of ``None`` indicates that default
 type comparison to proceed.
 
 
-.. _post_write_hooks:
+.. _autogenerate_column_renames:
+
+Renaming Columns with Explicit Rename Mappings
+----------------------------------------------
+
+Autogenerate by default treats a renamed column as a dropped column plus an
+added column, since there is no reliable way to guess that one column was
+renamed into another.  To have a rename rendered as an
+``op.alter_column()`` call using the ``new_column_name`` parameter, an
+explicit mapping of column renames can be passed using the
+:paramref:`.EnvironmentContext.configure.column_renames` parameter::
+
+    context.configure(
+        # ...
+        column_renames={
+            (None, "customer", "full_name"): "display_name",
+        },
+    )
+
+The mapping is keyed by ``(schema, table_name, old_name)`` tuples, where
+the schema may be ``None`` for the default schema; a ``(table_name,
+old_name)`` two-tuple is also accepted.  The value is the new column name.
+A sequence of ``(key, new_name)`` pairs is accepted as well.
+
+Only columns named explicitly in the mapping are treated as renames; no
+name-similarity guessing is applied, and columns not mentioned in the
+mapping continue to be compared using the usual rules.  The renamed column
+is still compared for all other attributes, including datatype, nullability,
+and server defaults, and indexes, unique constraints and foreign key
+constraints that refer to the renamed column - including foreign keys from
+other tables that refer to it - are matched by their new names, so they are
+not mistaken for unrelated changes.  Genuine changes to those objects are
+still detected normally.
+
+The mapping is validated before any migration is generated.  Errors are
+raised for mappings that rename one source column to several targets, whose
+target name is occupied by an unrelated existing column, that form cyclic
+renames, or whose source column or table cannot be found.  Renames that
+have already been applied to the database are skipped silently, so running
+autogenerate again after the migration was applied produces no spurious
+diffs.
+
+.. note::
+
+   On backends that recreate tables in batch mode (such as SQLite),
+   foreign keys in *other* tables that refer to a renamed column are not
+   updated by the table copy, the same as when a rename is issued by hand.
+   Use a native (non-batch) rename, or recreate the referring tables,
+   when renaming a column that is the target of foreign keys on such
+   backends.
+
+.. versionadded:: 1.21
+
++.. _post_write_hooks:
 
 Applying Post Processing and Python Code Formatters to Generated Revisions
 ---------------------------------------------------------------------------

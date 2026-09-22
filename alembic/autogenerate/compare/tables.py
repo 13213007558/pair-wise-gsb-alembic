@@ -200,6 +200,15 @@ def _compare_tables(
         metadata_table = tname_to_table[(s, tname)]
         conn_table = existing_metadata.tables[name]
 
+        if autogen_context.column_renames:
+            # consume + structurally validate rename entries for this
+            # table up front, even if the table is excluded by object
+            # filters, so that invalid mappings always raise before
+            # the migration is generated.
+            autogen_context.column_renames.renames_for_table(
+                s, tname, default_schema
+            )
+
         if autogen_context.run_object_filters(
             metadata_table, tname, "table", False, conn_table
         ):
@@ -226,6 +235,8 @@ def _compare_tables(
 
             if not modify_table_ops.is_empty():
                 upgrade_ops.ops.append(modify_table_ops)
+
+    autogen_context.column_renames.validate_all_consumed()
 
 
 @contextlib.contextmanager
@@ -254,7 +265,67 @@ def _compare_columns(
         )
     }
 
-    for cname in metadata_col_names.difference(conn_col_names):
+    # resolve explicit, user-supplied column renames for this table.
+    # renamed columns are paired by the mapping only; no name
+    # similarity guessing is applied anywhere.
+    renames: dict[str, str] = {}
+    if autogen_context.column_renames:
+        renames = autogen_context.active_renames_for_table(schema, tname)
+        if renames:
+            renames = {
+                old_name: new_name
+                for old_name, new_name in renames.items()
+                if autogen_context.run_object_filters(
+                    metadata_cols_by_name[new_name],
+                    new_name,
+                    "column",
+                    False,
+                    conn_table.c[old_name],
+                )
+            }
+
+    rename_sources = set(renames)
+    rename_targets = set(renames.values())
+
+    # renamed columns are compared first, so that the rename happens
+    # before any added column that might reuse a vacated name, and
+    # before constraints that reference the new names are reconciled.
+    for old_name, new_name in renames.items():
+        conn_col = conn_table.c[old_name]
+        metadata_col = metadata_cols_by_name[new_name]
+        alter_column_op = ops.AlterColumnOp(
+            tname, old_name, schema=schema, modify_name=new_name
+        )
+
+        autogen_context.comparators.dispatch(
+            "column", qualifier=autogen_context.dialect.name
+        )(
+            autogen_context,
+            alter_column_op,
+            schema,
+            tname,
+            old_name,
+            conn_col,
+            metadata_col,
+        )
+
+        if alter_column_op.has_changes():
+            modify_table_ops.ops.append(alter_column_op)
+            log.info(
+                "Detected renamed column '%s.%s' to '%s'",
+                name,
+                old_name,
+                new_name,
+            )
+
+    added_col_names = [
+        cname
+        for cname in metadata_col_names
+        if cname not in rename_targets
+        and (cname not in conn_col_names or cname in rename_sources)
+    ]
+
+    for cname in added_col_names:
         if autogen_context.run_object_filters(
             metadata_cols_by_name[cname], cname, "column", False, None
         ):
@@ -266,6 +337,9 @@ def _compare_columns(
             log.info("Detected added column '%s.%s'", name, cname)
 
     for colname in metadata_col_names.intersection(conn_col_names):
+        if colname in rename_sources:
+            # the connection-side column is consumed by a rename above
+            continue
         metadata_col = metadata_cols_by_name[colname]
         conn_col = conn_table.c[colname]
         if not autogen_context.run_object_filters(
@@ -292,6 +366,8 @@ def _compare_columns(
     yield
 
     for cname in set(conn_col_names).difference(metadata_col_names):
+        if cname in rename_sources:
+            continue
         if autogen_context.run_object_filters(
             conn_table.c[cname], cname, "column", True, None
         ):

@@ -8,9 +8,12 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 from sqlalchemy import inspect
+from sqlalchemy.exc import NoSuchTableError
 
 from . import compare
 from . import render
+from . import renames as renames_mod
+from .renames import ColumnRenameMap
 from .. import util
 from ..operations import ops
 from ..runtime.plugins import Plugin
@@ -42,7 +45,11 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def compare_metadata(context: MigrationContext, metadata: MetaData) -> Any:
+def compare_metadata(
+    context: MigrationContext,
+    metadata: MetaData,
+    column_renames: Any = None,
+) -> Any:
     """Compare a database schema to that given in a
     :class:`~sqlalchemy.schema.MetaData` instance.
 
@@ -155,6 +162,10 @@ def compare_metadata(context: MigrationContext, metadata: MetaData) -> Any:
      instance.
     :param metadata: a :class:`~sqlalchemy.schema.MetaData`
      instance.
+    :param column_renames: optional explicit mapping of column renames,
+     keyed by (schema, table_name, old_name) tuples with the new column
+     name as the value.  See the column_renames parameter of
+     EnvironmentContext.configure for details.
 
     .. seealso::
 
@@ -163,13 +174,17 @@ def compare_metadata(context: MigrationContext, metadata: MetaData) -> Any:
 
     """
 
-    migration_script = produce_migrations(context, metadata)
+    migration_script = produce_migrations(
+        context, metadata, column_renames=column_renames
+    )
     assert migration_script.upgrade_ops is not None
     return migration_script.upgrade_ops.as_diffs()
 
 
 def produce_migrations(
-    context: MigrationContext, metadata: MetaData
+    context: MigrationContext,
+    metadata: MetaData,
+    column_renames: Any = None,
 ) -> MigrationScript:
     """Produce a :class:`.MigrationScript` structure based on schema
     comparison.
@@ -179,6 +194,11 @@ def produce_migrations(
     :class:`.MigrationScript` object.   For an example of what this looks like,
     see the example in :ref:`customizing_revision`.
 
+    :param context: a :class:`.MigrationContext` instance.
+    :param metadata: a :class:`~sqlalchemy.schema.MetaData` instance.
+    :param column_renames: optional explicit mapping of column renames;
+     see :func:`.compare_metadata` for details.
+
     .. seealso::
 
         :func:`.compare_metadata` - returns more fundamental "diff"
@@ -186,7 +206,12 @@ def produce_migrations(
 
     """
 
-    autogen_context = AutogenContext(context, metadata=metadata)
+    opts: dict[str, Any] | None = None
+    if column_renames is not None:
+        opts = dict(context.opts)
+        opts["column_renames"] = column_renames
+
+    autogen_context = AutogenContext(context, metadata=metadata, opts=opts)
 
     migration_script = ops.MigrationScript(
         rev_id=None,
@@ -329,6 +354,10 @@ class AutogenContext:
 
     comparators: PriorityDispatcher
 
+    column_renames: ColumnRenameMap
+    """The explicit column rename mapping in use for this autogenerate
+    operation, derived from the column_renames option."""
+
     def __init__(
         self,
         migration_context: MigrationContext,
@@ -399,6 +428,12 @@ class AutogenContext:
         self.imports = set()
         self.opts: dict[str, Any] = opts
         self._has_batch: bool = False
+        self.column_renames = ColumnRenameMap.from_user_input(
+            opts.get("column_renames")
+        )
+        self._active_renames_cache: dict[
+            tuple[str | None, str], dict[str, str]
+        ] = {}
 
     @util.memoized_property
     def inspector(self) -> Inspector:
@@ -408,6 +443,111 @@ class AutogenContext:
                 "AutogenContext has no database connection"
             )
         return inspect(self.connection)
+
+    def _renames_for_table(
+        self, schema: str | None, tname: str
+    ) -> dict[str, str]:
+        """Return the validated, execution-ordered old->new column rename
+        mapping in effect for the given table, or an empty dict if there
+        are no renames.
+
+        """
+        if not self.column_renames:
+            return {}
+        default_schema = self.inspector.bind.dialect.default_schema_name
+        return self.column_renames.renames_for_table(
+            schema, tname, default_schema
+        )
+
+    def active_renames_for_table(
+        self, schema: str | None, tname: str
+    ) -> dict[str, str]:
+        """Return the column renames for the given table that are still
+        active, meaning they have not yet been applied to the database
+        and are consistent with the target metadata.
+
+        This is the mapping that all comparators (columns, indexes,
+        constraints, foreign keys) use so that renamed columns are
+        treated consistently; renames that are already applied or that
+        do not apply to the current metadata are excluded.
+
+        """
+        renames = self._renames_for_table(schema, tname)
+        if not renames:
+            return {}
+
+        cache = self._active_renames_cache
+        cache_key = (schema, tname)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        try:
+            conn_column_names = {
+                col["name"]
+                for col in self.inspector.get_columns(tname, schema=schema)
+            }
+        except NoSuchTableError:
+            conn_column_names = None
+
+        metadata_table = self._metadata_table_for(schema, tname)
+        if conn_column_names is None or metadata_table is None:
+            raise util.CommandError(
+                "Column rename mapping refers to table %r which is not "
+                "present in both the database and the target metadata; "
+                "rename source not found" % (tname,)
+            )
+
+        metadata_column_names = {
+            c.name for c in metadata_table.c if not c.system
+        }
+        active = renames_mod.validate_table_renames(
+            renames, schema, tname, conn_column_names, metadata_column_names
+        )
+        cache[cache_key] = active
+        return active
+
+    def _metadata_table_for(
+        self, schema: str | None, tname: str
+    ) -> Table | None:
+        default_schema = self.inspector.bind.dialect.default_schema_name
+        for key in (
+            sqla_compat._get_table_key(tname, schema),
+            sqla_compat._get_table_key(tname, default_schema),
+        ):
+            if key in self.table_key_to_table:
+                return self.table_key_to_table[key]
+        return None
+
+    def referred_table_renames(
+        self, schema: str | None, tname: str
+    ) -> dict[str, str]:
+        """Return the old->new column renames to apply to reflected
+        foreign key references that point at the given table.
+
+        A reflected foreign key reference is translated whenever the
+        target metadata carries the new column name and no longer
+        carries the old one.  Unlike active_renames_for_table this does
+        not consider the current database state of the referred table,
+        so that references that are stale in the database (e.g. after a
+        table-recreating rename on SQLite) still compare correctly
+        against the metadata.
+
+        """
+        renames = self._renames_for_table(schema, tname)
+        if not renames:
+            return {}
+        metadata_table = self._metadata_table_for(schema, tname)
+        if metadata_table is None:
+            return {}
+        metadata_column_names = {
+            c.name for c in metadata_table.c if not c.system
+        }
+        return {
+            old_name: new_name
+            for old_name, new_name in renames.items()
+            if new_name in metadata_column_names
+            and old_name not in metadata_column_names
+        }
 
     @contextlib.contextmanager
     def _within_batch(self) -> Iterator[None]:

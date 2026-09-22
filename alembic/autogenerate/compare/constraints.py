@@ -19,6 +19,7 @@ from sqlalchemy.sql.schema import Index
 from sqlalchemy.sql.schema import UniqueConstraint
 
 from .util import _InspectorConv
+from ..renames import renamed_table_copy
 from ... import util
 from ...ddl._autogen import is_index_sig
 from ...ddl._autogen import is_uq_sig
@@ -137,6 +138,31 @@ def _compare_indexes_and_uniques(
             # for DROP TABLE uniques are inline, don't need them
             conn_uniques = set()
         else:
+            if metadata_table is not None:
+                # translate reflected column names through the explicit
+                # rename mapping, so that constraints and indexes that
+                # refer to renamed columns are compared by their new
+                # names rather than looking like unrelated drop/adds
+                col_renames = autogen_context.active_renames_for_table(
+                    schema, tname
+                )
+                if col_renames:
+                    conn_table = renamed_table_copy(conn_table, col_renames)
+                    conn_uniques_reflected = [
+                        dict(
+                            uq_def,
+                            column_names=[
+                                col_renames.get(cname, cname)
+                                for cname in uq_def["column_names"]
+                            ],
+                        )
+                        for uq_def in conn_uniques_reflected
+                    ]
+                    conn_indexes_reflected = [
+                        _translate_index_renames(ix_def, col_renames)
+                        for ix_def in conn_indexes_reflected
+                    ]
+
             conn_uniques = {
                 _make_unique_constraint(impl, uq_def, conn_table)
                 for uq_def in conn_uniques_reflected
@@ -515,6 +541,24 @@ _IndexColumnSortingOps: Mapping[str, Any] = util.immutabledict(
 )
 
 
+def _translate_index_renames(
+    params: ReflectedIndex, col_renames: dict[str, str]
+) -> ReflectedIndex:
+    """Apply an explicit column rename mapping to a reflected index
+    definition, so the index is compared using the new column names."""
+    params = dict(params)  # type: ignore[assignment]
+    params["column_names"] = [
+        col_renames.get(cname, cname) if cname is not None else None
+        for cname in params["column_names"]
+    ]
+    if params.get("column_sorting"):
+        params["column_sorting"] = {
+            col_renames.get(cname, cname): sorting
+            for cname, sorting in params["column_sorting"].items()
+        }
+    return params
+
+
 def _make_index(
     impl: DefaultImpl, params: ReflectedIndex, conn_table: Table
 ) -> Index | None:
@@ -656,6 +700,40 @@ def _compare_foreign_keys(
             {"table_name": tname, "schema_name": schema},
         )
     ]
+
+    if autogen_context.column_renames:
+        # translate reflected column names through the explicit rename
+        # mapping, both for columns constrained on this table and for
+        # referred columns on other tables, so that foreign keys that
+        # refer to renamed columns are compared by their new names
+        # rather than looking like unrelated drop/adds
+        col_renames = autogen_context.active_renames_for_table(schema, tname)
+        translated_fks = []
+        any_renames = bool(col_renames)
+        for fk in conn_fks_list:
+            referred_renames = autogen_context.referred_table_renames(
+                fk["referred_schema"], fk["referred_table"]
+            )
+            if col_renames or referred_renames:
+                any_renames = True
+                fk = dict(fk)  # type: ignore[assignment]
+                fk["constrained_columns"] = [
+                    col_renames.get(cname, cname)
+                    for cname in fk["constrained_columns"]
+                ]
+                fk["referred_columns"] = [
+                    referred_renames.get(cname, cname)
+                    for cname in fk["referred_columns"]
+                ]
+            translated_fks.append(fk)
+        conn_fks_list = translated_fks
+        if any_renames:
+            # build the FK objects against an isolated copy of the
+            # reflected table, so that referred placeholder tables are
+            # created using the translated column names rather than
+            # resolving against the reflected referred table, which
+            # still carries the old column names
+            conn_table = renamed_table_copy(conn_table, col_renames)
 
     conn_fks = {
         _make_foreign_key(const, conn_table) for const in conn_fks_list
