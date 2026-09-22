@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -15,6 +16,7 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from . import plan
 from . import revision
 from . import write_hooks
 from .. import util
@@ -24,6 +26,7 @@ from ..util import not_none
 from ..util.pyfiles import _preserving_path_as_str
 
 if TYPE_CHECKING:
+    from .plan import MigrationPlan
     from .revision import _GetRevArg
     from .revision import _RevIdType
     from .revision import Revision
@@ -407,6 +410,39 @@ class ScriptDirectory:
 
         """
         return list(self.revision_map.bases)
+
+    def plan_migration(
+        self,
+        current_revs: str | Iterable[str] | None,
+        target: str,
+        direction: str = "upgrade",
+    ) -> MigrationPlan:
+        """Compute a serializable migration plan without a database.
+
+        Given the revisions currently present in the version table, a
+        target, and a direction, return a
+        :class:`.MigrationPlan` describing each revision step Alembic
+        would run, the set of current heads before and after every
+        step, and whether each step inserts, updates, or deletes rows
+        in the version table.
+
+        The plan is computed purely from the revision graph; no
+        database connection is established and no
+        ``upgrade()`` / ``downgrade()`` functions are invoked.
+
+        :param current_revs: revision identifier, or iterable of
+         identifiers, currently in the version table.  Pass an empty
+         collection (or ``None``) for a database at "base".
+        :param target: any target accepted by the ``upgrade`` /
+         ``downgrade`` commands: revision ids or prefixes, branch
+         labels such as ``branch@head``, symbols like ``heads`` or
+         ``base``, and relative forms like ``+2`` or ``-1``.
+        :param direction: ``"upgrade"`` or ``"downgrade"``.
+
+        .. versionadded:: 1.21
+
+        """
+        return plan.plan_migration(self, current_revs, target, direction)
 
     def _upgrade_revs(
         self, destination: str, current_rev: str
