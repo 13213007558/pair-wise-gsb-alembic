@@ -164,6 +164,14 @@ The built-in operation objects are listed below.
 .. automodule:: alembic.operations.ops
     :members:
 
+.. _operations_sort:
+
+Dependency-Aware Operation Sorting
+==================================
+
+.. automodule:: alembic.operations.sort
+    :members:
+
 .. _operations_extending_builtin:
 
 Extending Existing Operations
@@ -238,4 +246,3 @@ based on custom logic::
         # Custom logic to determine if table should be created
         # For example, check a configuration or metadata table
         return table_name not in get_ignored_tables()
-

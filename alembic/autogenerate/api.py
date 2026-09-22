@@ -13,6 +13,7 @@ from . import compare
 from . import render
 from .. import util
 from ..operations import ops
+from ..operations import sort as op_sort
 from ..runtime.plugins import Plugin
 from ..util import sqla_compat
 
@@ -636,6 +637,10 @@ class RevisionContext:
         hook = migration_context.opts["process_revision_directives"]
         if hook:
             hook(migration_context, rev, self.generated_revisions)
+
+        if migration_context.opts.get("sort_ops", False):
+            for migration_script in self.generated_revisions:
+                op_sort.sort_migration_script(migration_script)
 
         for migration_script in self.generated_revisions:
             migration_script._needs_render = True

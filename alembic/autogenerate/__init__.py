@@ -8,3 +8,5 @@ from .compare import comparators as comparators
 from .render import render_op_text as render_op_text
 from .render import renderers as renderers
 from .rewriter import Rewriter as Rewriter
+from ..operations.sort import sort_migration_script as sort_migration_script
+from ..operations.sort import sort_ops as sort_ops

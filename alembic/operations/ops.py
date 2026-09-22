@@ -13,11 +13,16 @@ from typing import cast
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+from sqlalchemy import Column
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.types import NULLTYPE
 
 from . import schemaobj
 from .base import BatchOperations
 from .base import Operations
+from .sort import ObjectRef
+from .sort import OpDependencies
 from .. import util
 from ..util import sqla_compat
 
@@ -30,9 +35,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import quoted_name
     from sqlalchemy.sql.elements import TextClause
     from sqlalchemy.sql.schema import CheckConstraint
-    from sqlalchemy.sql.schema import Column
     from sqlalchemy.sql.schema import Constraint
-    from sqlalchemy.sql.schema import ForeignKeyConstraint
     from sqlalchemy.sql.schema import Index
     from sqlalchemy.sql.schema import MetaData
     from sqlalchemy.sql.schema import PrimaryKeyConstraint
@@ -49,6 +52,51 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T", bound=Any)
 _AC = TypeVar("_AC", bound="AddConstraintOp")
+
+
+def _fk_constraint_target_refs(
+    items: Sequence[SchemaItem],
+) -> set[ObjectRef]:
+    """Return refs for tables targeted by FK constraints in ``items``.
+
+    Only :class:`~sqlalchemy.schema.ForeignKeyConstraint` items are
+    considered; these are what a create/drop table operation actually
+    emits as foreign keys.  This also means that when a plugin splits
+    foreign keys out of a :class:`.CreateTableOp` into separate
+    post-operations, the remaining operation no longer declares the
+    corresponding reads.
+    """
+    refs: set[ObjectRef] = set()
+    for item in items:
+        if isinstance(item, ForeignKeyConstraint):
+            try:
+                spec = sqla_compat._fk_spec(item)
+            except sa_exc.SQLAlchemyError:
+                continue
+            refs.add(ObjectRef.table(spec[4], spec[3]))
+    return refs
+
+
+def _column_fk_target_refs(column: Column[Any]) -> set[ObjectRef]:
+    """Return refs for tables targeted by a column's foreign keys."""
+    refs: set[ObjectRef] = set()
+    for fk in column.foreign_keys:
+        try:
+            target = fk.column
+        except sa_exc.SQLAlchemyError:
+            continue
+        if target is not None and target.table is not None:
+            refs.add(
+                ObjectRef.table(target.table.name, target.table.schema)
+            )
+    return refs
+
+
+def _constraint_ref_set(name: Any, schema: str | None) -> frozenset[ObjectRef]:
+    if isinstance(name, str) and name:
+        return frozenset({ObjectRef.constraint(name, schema)})
+    else:
+        return frozenset()
 
 
 class MigrateOperation:
@@ -81,6 +129,24 @@ class MigrateOperation:
 
     def to_diff_tuple(self) -> tuple[Any, ...]:
         raise NotImplementedError
+
+    def op_dependencies(self) -> OpDependencies | None:
+        """Return the schema object dependencies declared by this operation.
+
+        This is used by the optional operation sorting phase in
+        :mod:`alembic.operations.sort`; see :func:`.sort.sort_ops`
+        for background.
+
+        The default implementation returns ``None``, meaning the
+        dependencies of this operation are *unknown*.  Unknown
+        operations act as ordering barriers: the sorter will not move
+        other operations across them.  Custom operations that want to
+        take part in ordering should return an :class:`.OpDependencies`
+        object here, declaring the schema-qualified objects they
+        create, read, drop, or rename.
+
+        """
+        return None
 
 
 class AddConstraintOp(MigrateOperation):
@@ -153,6 +219,14 @@ class DropConstraintOp(MigrateOperation):
             return ("remove_fk", self.to_constraint())
         else:
             return ("remove_constraint", self.to_constraint())
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            drops=_constraint_ref_set(self.constraint_name, self.schema),
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+        )
 
     @classmethod
     def from_constraint(cls, constraint: Constraint) -> DropConstraintOp:
@@ -278,6 +352,14 @@ class CreatePrimaryKeyOp(AddConstraintOp):
         self.schema = schema
         self.kw = kw
 
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            creates=_constraint_ref_set(self.constraint_name, self.schema),
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+        )
+
     @classmethod
     def from_constraint(cls, constraint: Constraint) -> CreatePrimaryKeyOp:
         constraint_table = sqla_compat._table_for_constraint(constraint)
@@ -401,6 +483,14 @@ class CreateUniqueConstraintOp(AddConstraintOp):
         self.columns = columns
         self.schema = schema
         self.kw = kw
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            creates=_constraint_ref_set(self.constraint_name, self.schema),
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+        )
 
     @classmethod
     def from_constraint(
@@ -540,6 +630,22 @@ class CreateForeignKeyOp(AddConstraintOp):
 
     def to_diff_tuple(self) -> tuple[str, ForeignKeyConstraint]:
         return ("add_fk", self.to_constraint())
+
+    def op_dependencies(self) -> OpDependencies:
+        source_schema = self.kw.get("source_schema")
+        return OpDependencies(
+            creates=_constraint_ref_set(
+                self.constraint_name, source_schema
+            ),
+            reads=frozenset(
+                {
+                    ObjectRef.table(self.source_table, source_schema),
+                    ObjectRef.table(
+                        self.referent_table, self.kw.get("referent_schema")
+                    ),
+                }
+            ),
+        )
 
     @classmethod
     def from_constraint(cls, constraint: Constraint) -> CreateForeignKeyOp:
@@ -765,6 +871,14 @@ class CreateCheckConstraintOp(AddConstraintOp):
         self.schema = schema
         self.kw = kw
 
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            creates=_constraint_ref_set(self.constraint_name, self.schema),
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+        )
+
     @classmethod
     def from_constraint(
         cls, constraint: Constraint
@@ -904,6 +1018,20 @@ class CreateIndexOp(MigrateOperation):
 
     def to_diff_tuple(self) -> tuple[str, Index]:
         return ("add_index", self.to_index())
+
+    def op_dependencies(self) -> OpDependencies:
+        if self.index_name:
+            creates = frozenset(
+                {ObjectRef.index(self.index_name, self.schema)}
+            )
+        else:
+            creates = frozenset()
+        return OpDependencies(
+            creates=creates,
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+        )
 
     @classmethod
     def from_index(cls, index: Index) -> CreateIndexOp:
@@ -1055,6 +1183,21 @@ class DropIndexOp(MigrateOperation):
     def to_diff_tuple(self) -> tuple[str, Index]:
         return ("remove_index", self.to_index())
 
+    def op_dependencies(self) -> OpDependencies:
+        if isinstance(self.index_name, str) and self.index_name:
+            drops = frozenset(
+                {ObjectRef.index(self.index_name, self.schema)}
+            )
+        else:
+            drops = frozenset()
+        if self.table_name:
+            reads = frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            )
+        else:
+            reads = frozenset()
+        return OpDependencies(drops=drops, reads=reads)
+
     def reverse(self) -> CreateIndexOp:
         return CreateIndexOp.from_index(self.to_index())
 
@@ -1187,6 +1330,14 @@ class CreateTableOp(MigrateOperation):
 
     def to_diff_tuple(self) -> tuple[str, Table]:
         return ("add_table", self.to_table())
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            creates=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+            reads=frozenset(_fk_constraint_target_refs(self.columns)),
+        )
 
     @classmethod
     def from_table(
@@ -1348,6 +1499,18 @@ class DropTableOp(MigrateOperation):
     def to_diff_tuple(self) -> tuple[str, Table]:
         return ("remove_table", self.to_table())
 
+    def op_dependencies(self) -> OpDependencies:
+        if self._reverse is not None:
+            reads = _fk_constraint_target_refs(self._reverse.columns)
+        else:
+            reads = set()
+        return OpDependencies(
+            drops=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            ),
+            reads=frozenset(reads),
+        )
+
     def reverse(self) -> CreateTableOp:
         return CreateTableOp.from_table(self.to_table())
 
@@ -1476,6 +1639,16 @@ class RenameTableOp(AlterTableOp):
         op = cls(old_table_name, new_table_name, schema=schema)
         return operations.invoke(op)
 
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            renames=(
+                (
+                    ObjectRef.table(self.table_name, self.schema),
+                    ObjectRef.table(self.new_table_name, self.schema),
+                ),
+            )
+        )
+
 
 @Operations.register_operation("create_table_comment")
 @BatchOperations.register_operation(
@@ -1560,6 +1733,13 @@ class CreateTableCommentOp(AlterTableOp):
             schema=operations.impl.schema,
         )
         return operations.invoke(op)
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            )
+        )
 
     def reverse(self) -> CreateTableCommentOp | DropTableCommentOp:
         """Reverses the COMMENT ON operation against a table."""
@@ -1657,6 +1837,13 @@ class DropTableCommentOp(AlterTableOp):
             schema=operations.impl.schema,
         )
         return operations.invoke(op)
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            reads=frozenset(
+                {ObjectRef.table(self.table_name, self.schema)}
+            )
+        )
 
     def reverse(self) -> CreateTableCommentOp:
         """Reverses the COMMENT ON operation against a table."""
@@ -1789,6 +1976,32 @@ class AlterColumnOp(AlterTableOp):
             )
 
         return col_diff
+
+    def op_dependencies(self) -> OpDependencies:
+        if self.modify_name:
+            renames: tuple[tuple[ObjectRef, ObjectRef], ...] = (
+                (
+                    ObjectRef.column(
+                        self.table_name, self.column_name, self.schema
+                    ),
+                    ObjectRef.column(
+                        self.table_name, self.modify_name, self.schema
+                    ),
+                ),
+            )
+        else:
+            renames = ()
+        return OpDependencies(
+            reads=frozenset(
+                {
+                    ObjectRef.table(self.table_name, self.schema),
+                    ObjectRef.column(
+                        self.table_name, self.column_name, self.schema
+                    ),
+                }
+            ),
+            renames=renames,
+        )
 
     def has_changes(self) -> bool:
         hc1 = (
@@ -2057,6 +2270,20 @@ class AddColumnOp(AlterTableOp):
     def to_column(self) -> Column[Any]:
         return self.column
 
+    def op_dependencies(self) -> OpDependencies:
+        reads = {ObjectRef.table(self.table_name, self.schema)}
+        reads.update(_column_fk_target_refs(self.column))
+        return OpDependencies(
+            creates=frozenset(
+                {
+                    ObjectRef.column(
+                        self.table_name, self.column.name, self.schema
+                    )
+                }
+            ),
+            reads=frozenset(reads),
+        )
+
     @classmethod
     def from_column(cls, col: Column[Any]) -> AddColumnOp:
         return cls(col.table.name, col, schema=col.table.schema)
@@ -2305,6 +2532,21 @@ class DropColumnOp(AlterTableOp):
             self.to_column(),
         )
 
+    def op_dependencies(self) -> OpDependencies:
+        reads = {ObjectRef.table(self.table_name, self.schema)}
+        if self._reverse is not None:
+            reads.update(_column_fk_target_refs(self._reverse.column))
+        return OpDependencies(
+            drops=frozenset(
+                {
+                    ObjectRef.column(
+                        self.table_name, self.column_name, self.schema
+                    )
+                }
+            ),
+            reads=frozenset(reads),
+        )
+
     def reverse(self) -> AddColumnOp:
         if self._reverse is None:
             raise ValueError(
@@ -2429,6 +2671,13 @@ class BulkInsertOp(MigrateOperation):
         self.table = table
         self.rows = rows
         self.multiinsert = multiinsert
+
+    def op_dependencies(self) -> OpDependencies:
+        return OpDependencies(
+            reads=frozenset(
+                {ObjectRef.table(self.table.name, self.table.schema)}
+            )
+        )
 
     @classmethod
     def bulk_insert(
@@ -2672,6 +2921,26 @@ class OpContainer(MigrateOperation):
 
     def __init__(self, ops: Sequence[MigrateOperation] = ()) -> None:
         self.ops = list(ops)
+
+    def op_dependencies(self) -> OpDependencies | None:
+        creates: set[ObjectRef] = set()
+        reads: set[ObjectRef] = set()
+        drops: set[ObjectRef] = set()
+        renames: list[tuple[ObjectRef, ObjectRef]] = []
+        for op in self.ops:
+            deps = op.op_dependencies()
+            if deps is None:
+                return None
+            creates.update(deps.creates)
+            reads.update(deps.reads)
+            drops.update(deps.drops)
+            renames.extend(deps.renames)
+        return OpDependencies(
+            creates=frozenset(creates),
+            reads=frozenset(reads),
+            drops=frozenset(drops),
+            renames=tuple(renames),
+        )
 
     def is_empty(self) -> bool:
         return not self.ops
