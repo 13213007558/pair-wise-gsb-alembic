@@ -465,6 +465,8 @@ def upgrade(
     """
 
     script = ScriptDirectory.from_config(config)
+    if script.revision_manifest is not None:
+        script._verify_revision_files(script._version_locations)
 
     starting_rev = None
     if ":" in revision:
@@ -509,6 +511,9 @@ def downgrade(
     """
 
     script = ScriptDirectory.from_config(config)
+    if script.revision_manifest is not None:
+        script._verify_revision_files(script._version_locations)
+
     starting_rev = None
     if ":" in revision:
         if not sql:

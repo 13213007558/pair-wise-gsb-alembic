@@ -10,8 +10,10 @@ import os
 import pathlib
 import re
 import tempfile
+import types
 from types import ModuleType
 from typing import Any
+from typing import Union
 
 from mako import exceptions
 from mako.template import Template
@@ -127,6 +129,68 @@ def load_python_file(
 
 def load_module_py(module_id: str, path: str | os.PathLike[str]) -> ModuleType:
     spec = importlib.util.spec_from_file_location(module_id, path)
+    assert spec
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore
+    return module
+
+
+class _VerifiedSourceFileLoader(importlib.machinery.SourceFileLoader):
+    def __init__(
+        self,
+        fullname: str,
+        path: str | os.PathLike[str],
+        data: bytes,
+    ) -> None:
+        super().__init__(fullname, _preserving_path_as_str(path))
+        self._verified_data = data
+
+    def get_data(self, path: str | bytes | os.PathLike[Any]) -> bytes:
+        return self._verified_data
+
+    def path_stats(self, path: str | os.PathLike[str]) -> dict[str, int]:
+        return {"mtime": 0, "size": len(self._verified_data)}
+
+    def set_data(
+        self, path: str, data: Any, *, _mode: int = 0o666
+    ) -> None:
+        return None
+
+    def get_code(self, fullname: str) -> types.CodeType | None:
+        source = self.get_data(self.path)
+        return self.source_to_code(source, self.path)
+
+
+class _VerifiedSourcelessFileLoader(
+    importlib.machinery.SourcelessFileLoader
+):
+    def __init__(
+        self,
+        fullname: str,
+        path: str | os.PathLike[str],
+        data: bytes,
+    ) -> None:
+        super().__init__(fullname, _preserving_path_as_str(path))
+        self._verified_data = data
+
+    def get_data(self, path: str | bytes | os.PathLike[Any]) -> bytes:
+        return self._verified_data
+
+
+def load_module_py_data(
+    module_id: str, path: str | os.PathLike[str], data: bytes
+) -> ModuleType:
+    path = pathlib.Path(path)
+    loader: Union[
+        _VerifiedSourceFileLoader, _VerifiedSourcelessFileLoader
+    ]
+    if path.suffix == ".py":
+        loader = _VerifiedSourceFileLoader(module_id, path, data)
+    else:
+        loader = _VerifiedSourcelessFileLoader(module_id, path, data)
+    spec = importlib.util.spec_from_file_location(
+        module_id, path, loader=loader
+    )
     assert spec
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # type: ignore

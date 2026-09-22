@@ -422,6 +422,23 @@ This file contains the following features:
   allow revisions to exist in multiple directories simultaneously.
   See :ref:`multiple_bases` for examples.
 
+* ``revision_manifest`` - optional path to a JSON file containing the exact
+  revision files that may be loaded along with their SHA-256 digests. When
+  configured, Alembic uses strict verification for upgrade, downgrade and all
+  revision graph reads. Files are checked and read into memory before any
+  revision module is imported; replaced, missing, additional, duplicated, or
+  symlink-aliased revisions cause the operation to abort. Manifest paths are
+  interpreted relative to the manifest file and must reside within configured
+  ``version_locations``. This is a release-package integrity check, not a
+  Python sandbox or a signature system. The manifest uses the following form::
+
+      {
+          "revision_files": {
+              "migrations/versions/001_initial.py": "sha256-hex",
+              "other/versions/002_feature.py": "sha256-hex"
+          }
+      }
+
 * ``path_separator`` - a separator character for the ``version_locations``
   and ``prepend_sys_path`` path lists.  Only applies to configparser config,
   not needed if ``pyproject.toml`` configuration is used.
@@ -1050,5 +1067,4 @@ Next Steps
 
 The vast majority of Alembic environments make heavy use of the
 "autogenerate" feature.   Continue onto the next section, :doc:`autogenerate`.
-
 

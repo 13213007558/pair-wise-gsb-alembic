@@ -15,6 +15,7 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from . import manifest
 from . import revision
 from . import write_hooks
 from .. import util
@@ -80,6 +81,7 @@ class ScriptDirectory:
         messaging_opts: MessagingOptions = cast(
             "MessagingOptions", util.EMPTY_DICT
         ),
+        revision_manifest: str | os.PathLike[str] | None = None,
     ) -> None:
         self.dir = _preserving_path_as_str(dir)
         self.version_locations = [
@@ -94,6 +96,14 @@ class ScriptDirectory:
         self.hooks = hooks
         self.recursive_version_locations = recursive_version_locations
         self.messaging_opts = messaging_opts
+        self.revision_manifest = (
+            _preserving_path_as_str(revision_manifest)
+            if revision_manifest is not None
+            else None
+        )
+        self._verified_revisions: (
+            dict[Path, manifest.VerifiedRevisionFile] | None
+        ) = None
 
         if not os.access(dir, os.F_OK):
             raise util.CommandError(
@@ -134,6 +144,17 @@ class ScriptDirectory:
     def _load_revisions(self) -> Iterator[Script]:
         paths = [vers for vers in self._version_locations if vers.exists()]
 
+        if self.revision_manifest is not None:
+            self._verify_revision_files(paths)
+            verified_revisions = not_none(self._verified_revisions)
+            for verified in verified_revisions.values():
+                yield not_none(
+                    Script._from_path(
+                        self, verified.path, data=verified.data
+                    )
+                )
+            return
+
         dupes = set()
         for vers in paths:
             for file_path in Script._list_py_dir(self, vers):
@@ -146,10 +167,33 @@ class ScriptDirectory:
                     continue
                 dupes.add(real_path)
 
+                if Script._revision_path_for_file(self, real_path) is None:
+                    continue
                 script = Script._from_path(self, real_path)
                 if script is None:
                     continue
                 yield script
+
+    def _verify_revision_files(self, paths: Sequence[Path]) -> None:
+        if self._verified_revisions is not None:
+            return
+
+        revision_files: list[tuple[Path, Path]] = []
+        for vers in paths:
+            for file_path in Script._list_py_dir(self, vers):
+                revision_path = Script._revision_path_for_file(
+                    self, file_path
+                )
+                if revision_path is not None:
+                    revision_files.append(
+                        (revision_path, revision_path.resolve(strict=False))
+                    )
+
+        self._verified_revisions = manifest.verify_revision_manifest(
+            not_none(self.revision_manifest),
+            self._version_locations,
+            revision_files,
+        )
 
     @classmethod
     def from_config(cls, config: Config) -> ScriptDirectory:
@@ -192,6 +236,9 @@ class ScriptDirectory:
             hooks=config.get_hooks_list(),
             recursive_version_locations=rvl,
             messaging_opts=config.messaging_opts,
+            revision_manifest=config.get_alembic_option(
+                "revision_manifest"
+            ),
         )
 
     @contextmanager
@@ -1003,10 +1050,9 @@ class Script(revision.Revision):
         return paths
 
     @classmethod
-    def _from_path(
+    def _revision_path_for_file(
         cls, scriptdir: ScriptDirectory, path: str | os.PathLike[str]
-    ) -> Script | None:
-
+    ) -> Path | None:
         path = Path(path)
         dir_, filename = path.parent, path.name
 
@@ -1018,25 +1064,39 @@ class Script(revision.Revision):
         if not py_match:
             return None
 
-        py_filename = py_match.group(1)
+        if not scriptdir.sourceless:
+            return path
 
-        if scriptdir.sourceless:
-            is_c = py_match.group(2) == "c"
-            is_o = py_match.group(2) == "o"
-        else:
-            is_c = is_o = False
+        py_filename = py_match.group(1)
+        is_c = py_match.group(2) == "c"
+        is_o = py_match.group(2) == "o"
 
         if is_o or is_c:
             py_exists = (dir_ / py_filename).exists()
             pyc_exists = (dir_ / (py_filename + "c")).exists()
 
-            # prefer .py over .pyc because we'd like to get the
-            # source encoding; prefer .pyc over .pyo because we'd like to
-            # have the docstrings which a -OO file would not have
+            # Prefer source over bytecode, and .pyc over optimized .pyo.
             if py_exists or is_o and pyc_exists:
                 return None
+        return path
 
-        module = util.load_python_file(dir_, filename)
+    @classmethod
+    def _from_path(
+        cls,
+        scriptdir: ScriptDirectory,
+        path: str | os.PathLike[str],
+        data: bytes | None = None,
+    ) -> Script | None:
+
+        path = Path(path)
+        dir_, filename = path.parent, path.name
+
+        if data is None:
+            module = util.load_python_file(dir_, filename)
+        else:
+            module = util.load_module_py_data(
+                re.sub(r"\W", "_", filename), path, data
+            )
 
         if not hasattr(module, "revision"):
             # attempt to get the revision id from the script name,
