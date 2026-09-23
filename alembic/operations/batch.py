@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 from typing import TYPE_CHECKING
 
@@ -65,6 +66,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        preserve_triggers,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +89,19 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        if preserve_triggers is None:
+            preserve_triggers = False
+        if not (
+            preserve_triggers is True
+            or preserve_triggers is False
+            or isinstance(preserve_triggers, Mapping)
+        ):
+            raise ValueError(
+                "preserve_triggers must be True, False, or a mapping of "
+                "trigger names to full replacement CREATE TRIGGER "
+                "statements."
+            )
+        self.preserve_triggers = preserve_triggers
         self.batch = []
 
     @property

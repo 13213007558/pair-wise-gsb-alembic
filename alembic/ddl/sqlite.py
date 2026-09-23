@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from typing import NamedTuple
 from typing import TYPE_CHECKING
 
 from sqlalchemy import cast
@@ -232,3 +233,244 @@ def visit_column_name(element: ColumnName, compiler: DDLCompiler, **kw) -> str:
 #    for const in column.constraints:
 #        text += compiler.process(AddConstraint(const))
 #    return text
+
+
+class SQLiteTriggerParseError(Exception):
+    """Raised when a SQLite CREATE TRIGGER statement cannot be analyzed."""
+
+
+class SQLiteTrigger(NamedTuple):
+    """Structure of a parsed SQLite CREATE TRIGGER statement."""
+
+    name: str
+    schema: str | None
+    table_name: str
+    table_schema: str | None
+    is_temp: bool
+    column_refs: frozenset[str]
+    """names of columns of the trigger's own table that the trigger
+    refers to, via the UPDATE OF column list as well as OLD./NEW./
+    <table>. qualified references."""
+
+
+class _TriggerToken(NamedTuple):
+    kind: str  # "ident", "qident", "string", "punct", "other"
+    value: str
+
+
+_TRIGGER_NAME_KINDS = ("ident", "qident", "string")
+
+_DOT = _TriggerToken("punct", ".")
+_COMMA = _TriggerToken("punct", ",")
+_SEMICOLON = _TriggerToken("punct", ";")
+
+
+def _consume_quoted_token(sql: str, start: int, quote: str) -> tuple[str, int]:
+    # sql[start] == quote; handles doubled-quote escapes
+    i = start + 1
+    chars = []
+    while True:
+        j = sql.find(quote, i)
+        if j == -1:
+            raise SQLiteTriggerParseError("unterminated quoted token")
+        chars.append(sql[i:j])
+        if j + 1 < len(sql) and sql[j + 1] == quote:
+            chars.append(quote)
+            i = j + 2
+        else:
+            return "".join(chars), j + 1
+
+
+def _tokenize_trigger_sql(sql: str) -> list[_TriggerToken]:
+    tokens: list[_TriggerToken] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i + 2)
+            i = n if j == -1 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            if j == -1:
+                raise SQLiteTriggerParseError("unterminated comment")
+            i = j + 2
+        elif ch == "'":
+            value, i = _consume_quoted_token(sql, i, "'")
+            tokens.append(_TriggerToken("string", value))
+        elif ch == '"' or ch == "`":
+            value, i = _consume_quoted_token(sql, i, ch)
+            tokens.append(_TriggerToken("qident", value))
+        elif ch == "[":
+            j = sql.find("]", i + 1)
+            if j == -1:
+                raise SQLiteTriggerParseError(
+                    "unterminated [..] quoted identifier"
+                )
+            tokens.append(_TriggerToken("qident", sql[i + 1 : j]))
+            i = j + 1
+        elif ch.isalpha() or ch == "_" or ord(ch) > 127:
+            j = i + 1
+            while j < n and (
+                sql[j].isalnum() or sql[j] in "_$" or ord(sql[j]) > 127
+            ):
+                j += 1
+            tokens.append(_TriggerToken("ident", sql[i:j]))
+            i = j
+        elif ch.isdigit():
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] == "."):
+                j += 1
+            tokens.append(_TriggerToken("other", sql[i:j]))
+            i = j
+        else:
+            tokens.append(_TriggerToken("punct", ch))
+            i += 1
+    return tokens
+
+
+def _is_kw(token: _TriggerToken, *keywords: str) -> bool:
+    return token.kind == "ident" and token.value.upper() in keywords
+
+
+def _parse_trigger_qualified_name(
+    tokens: list[_TriggerToken], pos: int
+) -> tuple[str | None, str, int]:
+    if pos >= len(tokens) or tokens[pos].kind not in _TRIGGER_NAME_KINDS:
+        raise SQLiteTriggerParseError("expected a name")
+    first = tokens[pos].value
+    pos += 1
+    if pos < len(tokens) and tokens[pos] == _DOT:
+        if (
+            pos + 1 >= len(tokens)
+            or tokens[pos + 1].kind not in _TRIGGER_NAME_KINDS
+        ):
+            raise SQLiteTriggerParseError("expected a name after '.'")
+        return first, tokens[pos + 1].value, pos + 2
+    return None, first, pos
+
+
+def parse_create_trigger(sql: str) -> SQLiteTrigger:
+    """Parse a SQLite CREATE TRIGGER statement.
+
+    The statement is tokenized and its header is validated; column
+    dependencies of the trigger on its own table are collected from the
+    UPDATE OF column list as well as OLD., NEW. and <table>. qualified
+    references found anywhere in the WHEN clause or the trigger body,
+    including multi-statement bodies.  Quoted names (double quotes,
+    backticks, square brackets, and string-literal style single quotes)
+    are recognized.
+
+    :raises SQLiteTriggerParseError: if the statement cannot be
+     analyzed.  Callers must treat this as "unsafe" and must not fall
+     back to textual manipulation of the statement.
+
+    """
+    tokens = _tokenize_trigger_sql(sql)
+    if not tokens or not _is_kw(tokens[0], "CREATE"):
+        raise SQLiteTriggerParseError("statement does not start with CREATE")
+    pos = 1
+    is_temp = False
+    if pos < len(tokens) and _is_kw(tokens[pos], "TEMP", "TEMPORARY"):
+        is_temp = True
+        pos += 1
+    if pos >= len(tokens) or not _is_kw(tokens[pos], "TRIGGER"):
+        raise SQLiteTriggerParseError("statement is not a CREATE TRIGGER")
+    pos += 1
+    if (
+        pos + 2 < len(tokens)
+        and _is_kw(tokens[pos], "IF")
+        and _is_kw(tokens[pos + 1], "NOT")
+        and _is_kw(tokens[pos + 2], "EXISTS")
+    ):
+        pos += 3
+    schema, name, pos = _parse_trigger_qualified_name(tokens, pos)
+
+    if pos < len(tokens) and _is_kw(tokens[pos], "BEFORE", "AFTER"):
+        pos += 1
+    elif pos < len(tokens) and _is_kw(tokens[pos], "INSTEAD"):
+        if pos + 1 >= len(tokens) or not _is_kw(tokens[pos + 1], "OF"):
+            raise SQLiteTriggerParseError("expected OF after INSTEAD")
+        pos += 2
+
+    column_refs: set[str] = set()
+    if pos < len(tokens) and _is_kw(tokens[pos], "INSERT", "DELETE"):
+        pos += 1
+    elif pos < len(tokens) and _is_kw(tokens[pos], "UPDATE"):
+        pos += 1
+        if pos < len(tokens) and _is_kw(tokens[pos], "OF"):
+            pos += 1
+            while True:
+                if (
+                    pos >= len(tokens)
+                    or tokens[pos].kind not in _TRIGGER_NAME_KINDS
+                ):
+                    raise SQLiteTriggerParseError(
+                        "expected a column name in the UPDATE OF clause"
+                    )
+                column_refs.add(tokens[pos].value)
+                pos += 1
+                if pos < len(tokens) and tokens[pos] == _COMMA:
+                    pos += 1
+                else:
+                    break
+    else:
+        raise SQLiteTriggerParseError("expected INSERT, UPDATE, or DELETE")
+
+    if pos >= len(tokens) or not _is_kw(tokens[pos], "ON"):
+        raise SQLiteTriggerParseError("expected ON")
+    pos += 1
+    table_schema, table_name, pos = _parse_trigger_qualified_name(tokens, pos)
+
+    begin_pos = None
+    for j in range(pos, len(tokens)):
+        if _is_kw(tokens[j], "BEGIN"):
+            begin_pos = j
+            break
+    if begin_pos is None:
+        raise SQLiteTriggerParseError("trigger has no BEGIN..END body")
+
+    case_depth = 0
+    end_pos = None
+    for j in range(begin_pos + 1, len(tokens)):
+        if _is_kw(tokens[j], "CASE"):
+            case_depth += 1
+        elif _is_kw(tokens[j], "END"):
+            if case_depth:
+                case_depth -= 1
+            else:
+                end_pos = j
+                break
+    if end_pos is None:
+        raise SQLiteTriggerParseError("trigger body is not terminated by END")
+    rest = tokens[end_pos + 1 :]
+    if rest and rest != [_SEMICOLON]:
+        raise SQLiteTriggerParseError(
+            "unexpected tokens after the trigger body"
+        )
+
+    qualifiers = {"OLD", "NEW", table_name.upper()}
+    for j, token in enumerate(tokens):
+        if token.kind not in ("ident", "qident"):
+            continue
+        if token.value.upper() not in qualifiers:
+            continue
+        if j > 0 and tokens[j - 1] == _DOT:
+            # the token is itself qualified, e.g. main."t"
+            continue
+        if (
+            j + 2 < len(tokens)
+            and tokens[j + 1] == _DOT
+            and tokens[j + 2].kind in _TRIGGER_NAME_KINDS
+        ):
+            column_refs.add(tokens[j + 2].value)
+
+    return SQLiteTrigger(
+        name=name,
+        schema=schema,
+        table_name=table_name,
+        table_schema=table_schema,
+        is_temp=is_temp,
+        column_refs=frozenset(column_refs),
+    )
