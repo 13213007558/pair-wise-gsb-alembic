@@ -255,6 +255,114 @@ have the ``.name`` attribute set will **not** have CHECK constraints
 regenerated.  This name can be set by specifying the ``.name`` parameter
 or by using a named Python ``Enum`` object as the source of enumeration.
 
+.. _batch_triggers:
+
+Preserving Triggers
+^^^^^^^^^^^^^^^^^^^
+
+When a table is recreated using "move and copy", the old table is dropped,
+and **any triggers that were defined on the table are dropped along with
+it**.  Up through Alembic 1.20, and by default in later versions, this
+loss is silent: indexes are carried over to the new table, but triggers
+are not.
+
+On SQLite, the :paramref:`.Operations.batch_alter_table.preserve_triggers`
+parameter opts into trigger preservation::
+
+    with op.batch_alter_table(
+        "some_table", recreate="always", preserve_triggers=True
+    ) as batch_op:
+        batch_op.alter_column("data", type_=String(100))
+
+With ``preserve_triggers=True``, the triggers of the table are reflected
+from the ``sqlite_master`` table of the **main database** before the
+recreate begins, and are re-created, with their original definitions,
+only **after** the data copy has completed and the new table has been
+renamed into place.  The ``INSERT ... SELECT`` data copy itself therefore
+does not fire any trigger, so e.g. audit tables do not gain spurious rows
+from the migration.
+
+If the batch drops or renames a column, any trigger whose definition
+references that column - whether in a ``WHEN`` clause, an ``OLD.`` or
+``NEW.`` reference, an ``UPDATE OF`` clause, or a multi-statement body,
+quoted or not - can no longer be re-created as-is.  Alembic does **not**
+attempt to rewrite trigger definitions with string substitution.  Instead,
+the migration author must supply a complete replacement definition for
+each affected trigger by passing a dictionary::
+
+    with op.batch_alter_table(
+        "some_table",
+        recreate="always",
+        preserve_triggers={
+            "trg_some_table_audit": (
+                "CREATE TRIGGER trg_some_table_audit "
+                "AFTER UPDATE OF new_col ON some_table "
+                "BEGIN "
+                "INSERT INTO audit (tbl, old_val, new_val) "
+                "VALUES ('some_table', OLD.new_col, NEW.new_col); "
+                "END"
+            ),
+        },
+    ) as batch_op:
+        batch_op.alter_column("old_col", new_column_name="new_col")
+
+Each dictionary key must be the name of an existing trigger on the table;
+the value is used verbatim as the new definition and must be a plain
+``CREATE TRIGGER`` statement (not ``TEMP``) that creates a trigger of the
+same name.  A value of ``None`` drops that trigger deliberately.  If a
+trigger that depends on a dropped or renamed column has no entry in the
+dictionary, the batch is aborted with an error.  The dependency analysis
+is deliberately conservative: identifiers are scanned without full SQL
+parsing, so a trigger may be flagged even when the name it mentions is
+not actually a reference to the changed column; when in doubt, Alembic
+refuses to guess and requires the explicit replacement.
+
+Replacement definitions are validated **before any destructive step**:
+they are compiled inside a SAVEPOINT that is then rolled back, while the
+old table and its triggers are still in place.  An invalid replacement
+therefore aborts the batch with the old table, its data and its triggers
+fully intact.  Note that SQLite itself only parses trigger bodies at
+``CREATE TRIGGER`` time and resolves table and column names lazily, so
+this validation is a syntax check; correctness of the names used in the
+body remains the migration author's responsibility.
+
+.. _batch_trigger_transactions:
+
+Transaction boundaries of the recreate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The whole recreate sequence - create the new table, copy the data, drop
+the old table, rename, re-create indexes, and finally re-create preserved
+triggers - runs inside a **single database transaction**: if the
+connection is not already inside a transaction, one is begun for the
+duration of the flush and is committed only when every step has
+succeeded.  SQLite fully supports transactional DDL, so ``CREATE TABLE``,
+``DROP TABLE``, ``ALTER TABLE ... RENAME`` and ``CREATE TRIGGER`` all roll
+back with the transaction.  If any step fails - including restoration of
+a trigger - rolling back the surrounding transaction restores the old
+table, its data and its triggers exactly as they were.
+
+Note that Alembic's SQLite dialect sets
+:paramref:`.EnvironmentContext.configure.transactional_ddl` to ``False``
+for historical reasons related to the pysqlite driver's legacy implicit
+commit behavior (removed in Python 3.6); this flag only controls whether
+Alembic wraps whole migrations in a transaction itself, and does not
+affect the atomicity guarantees above, which apply to the batch flush
+itself.  When the connection is already inside a transaction (for example
+under ``transaction_per_migration`` or an externally managed
+transaction), atomicity is provided by that surrounding transaction, and
+rolling it back on failure restores the pre-batch state.
+
+.. versionadded:: 1.21
+   Added the :paramref:`.Operations.batch_alter_table.preserve_triggers`
+   parameter.  The default behavior of silently dropping triggers on
+   table recreate is unchanged.
+
+.. note::  ``preserve_triggers`` currently supports only ordinary tables
+   in the main database of a SQLite connection, and requires a live
+   ("online") database connection; it cannot be used with a schema name
+   or in ``--sql`` offline mode.
+
 Dealing with Referencing Foreign Keys
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

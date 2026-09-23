@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,59 @@ if TYPE_CHECKING:
     from ..ddl.base import _ServerDefaultType
     from ..ddl.impl import DefaultImpl
 
+_quoted_ident = r'(?:"(?:[^"]|"")*"|\[[^\]]*\]|`[^`]*`)'
+
+_ident = r'(?:"(?:[^"]|"")*"|\[[^\]]*\]|`[^`]*`|[A-Za-z_][A-Za-z0-9_$]*)'
+
+_trigger_token_re = re.compile(
+    r"""
+    '(?:[^']|'')*'           # string literal
+    | --[^\n]*              # line comment
+    | /\*.*?\*/            # block comment
+    | (?P<quoted>""" + _quoted_ident + r""")
+    | (?P<bare>[A-Za-z_\x80-\uffff][A-Za-z0-9_$\x80-\uffff]*)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+_create_trigger_re = re.compile(
+    r"^\s*CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"(?:" + _ident + r"\s*\.\s*)?"
+    r"(?P<name>" + _ident + r")(?![\w$.])",
+    re.IGNORECASE,
+)
+
+
+def _unquote_ident(ident: str) -> str:
+    if ident[0] in ('"', "`"):
+        return ident[1:-1].replace(ident[0] * 2, ident[0])
+    elif ident[0] == "[":
+        return ident[1:-1]
+    else:
+        return ident
+
+
+def _trigger_referenced_names(trigger_sql: str) -> set[str]:
+    """Return the lower-cased names of all identifiers that appear in a
+    trigger definition, excluding string literals and comments.
+
+    This is a deliberately conservative scan: keywords such as ``NEW``,
+    ``OLD``, ``BEGIN`` and ``END`` are included in the result, and no
+    attempt is made to distinguish column references from table or
+    function names.  When in doubt, a name is reported as referenced.
+
+    """
+    names = set()
+    for match in _trigger_token_re.finditer(trigger_sql):
+        token = match.group("quoted")
+        if token is not None:
+            names.add(_unquote_ident(token).lower())
+        else:
+            token = match.group("bare")
+            if token is not None:
+                names.add(token.lower())
+    return names
+
 
 class BatchOperationsImpl:
     def __init__(
@@ -65,6 +119,7 @@ class BatchOperationsImpl:
         reflect_kwargs,
         naming_convention,
         partial_reordering,
+        preserve_triggers=False,
     ):
         self.operations = operations
         self.table_name = table_name
@@ -87,6 +142,12 @@ class BatchOperationsImpl:
         )
         self.naming_convention = naming_convention
         self.partial_reordering = partial_reordering
+        if preserve_triggers is False or preserve_triggers is None:
+            self.preserve_triggers = None
+        elif preserve_triggers is True:
+            self.preserve_triggers = {}
+        else:
+            self.preserve_triggers = dict(preserve_triggers)
         self.batch = []
 
     @property
@@ -114,6 +175,8 @@ class BatchOperationsImpl:
                     fn = getattr(self.operations.impl, opname)
                     fn(*arg, **kw)
             else:
+                if self.preserve_triggers is not None:
+                    self._check_preserve_triggers_supported()
                 m1 = MetaData()
 
                 if self.copy_from is not None:
@@ -170,7 +233,163 @@ class BatchOperationsImpl:
                     fn = getattr(batch_impl, opname)
                     fn(*arg, **kw)
 
-                batch_impl._create(self.impl)
+                if self.preserve_triggers is not None:
+                    preserved_triggers = self._resolve_preserved_triggers()
+                else:
+                    preserved_triggers = ()
+
+                batch_impl._create(
+                    self.impl, preserved_triggers=preserved_triggers
+                )
+
+    def _check_preserve_triggers_supported(self) -> None:
+        if self.operations.migration_context.as_sql:
+            raise exc.CommandError(
+                "The preserve_triggers option requires a live database "
+                "connection with which to reflect the triggers of table "
+                f'"{self.table_name}"; it cannot be used in --sql mode.'
+            )
+        if self.impl.dialect.name != "sqlite":
+            raise exc.CommandError(
+                "The preserve_triggers option is currently only supported "
+                "on SQLite."
+            )
+        if self.schema:
+            raise exc.CommandError(
+                "The preserve_triggers option currently supports only "
+                "tables in the main database; it cannot be used with a "
+                "schema name."
+            )
+
+    def _changed_column_names(self) -> set[str]:
+        """Return the lower-cased names of columns that will no longer
+        exist under their current name in the recreated table, i.e.
+        columns that are dropped or renamed by the batch."""
+        dropped = set()
+        renamed = set()
+        added = set()
+        for opname, arg, kw in self.batch:
+            if opname == "drop_column":
+                col = arg[1]
+                dropped.add(getattr(col, "name", col))
+            elif opname == "add_column":
+                added.add(arg[1].name)
+            elif opname == "alter_column":
+                new_name = kw.get("name")
+                if new_name is not None and new_name != arg[1]:
+                    renamed.add(arg[1])
+        gone = (dropped | renamed) - added
+        return {name.lower() for name in gone}
+
+    def _resolve_preserved_triggers(self) -> list[str]:
+        """Reflect the triggers of the table being recreated and return
+        the list of CREATE TRIGGER statements to emit after the new table
+        is in place.
+
+        Raises CommandError if a trigger depends on a column that is
+        being dropped or renamed and no explicit replacement definition
+        was supplied for it.
+        """
+        connection = self.impl.connection
+        gone = self._changed_column_names()
+
+        reflected = connection.exec_driver_sql(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = ?",
+            (self.table_name,),
+        ).all()
+
+        replacements = {
+            name.lower(): sql for name, sql in self.preserve_triggers.items()
+        }
+        reflected_names = set()
+        resolved = []
+        replacement_sqls = []
+        for trig_name, trig_sql in reflected:
+            if trig_sql is None:
+                continue
+            reflected_names.add(trig_name.lower())
+            replacement = replacements.get(trig_name.lower(), False)
+            if replacement is None:
+                # explicitly omitted by the migration author
+                continue
+            elif replacement is not False:
+                self._check_replacement_trigger(trig_name, replacement)
+                resolved.append(replacement)
+                replacement_sqls.append((trig_name, replacement))
+            elif gone & _trigger_referenced_names(trig_sql):
+                raise exc.CommandError(
+                    f'Trigger "{trig_name}" on table "{self.table_name}" '
+                    "may depend on column(s) that are being dropped or "
+                    "renamed by this migration; pass a complete "
+                    "replacement definition for this trigger using the "
+                    "preserve_triggers dictionary, or None to drop it "
+                    "deliberately."
+                )
+            else:
+                resolved.append(trig_sql)
+
+        unknown = set(replacements) - reflected_names
+        if unknown:
+            raise exc.CommandError(
+                f"preserve_triggers refers to trigger(s) "
+                f"{', '.join(sorted(unknown))} which do not exist on "
+                f'table "{self.table_name}".'
+            )
+
+        self._validate_replacement_triggers(connection, replacement_sqls)
+        return resolved
+
+    def _check_replacement_trigger(
+        self, trig_name: str, replacement: str
+    ) -> None:
+        match = _create_trigger_re.match(replacement)
+        if match is None:
+            raise exc.CommandError(
+                f"Replacement definition for trigger "
+                f'"{trig_name}" must be a plain CREATE TRIGGER statement; '
+                f"got: {replacement!r}"
+            )
+        elif _unquote_ident(match.group("name")).lower() != trig_name.lower():
+            raise exc.CommandError(
+                f"Replacement definition for trigger "
+                f'"{trig_name}" creates a trigger named '
+                f'"{_unquote_ident(match.group("name"))}"; the names '
+                "must match."
+            )
+
+    def _validate_replacement_triggers(self, connection, replacement_sqls):
+        """Syntax-check replacement trigger definitions before any
+        destructive step of the recreate has taken place.
+
+        The check runs inside a SAVEPOINT that is rolled back, so the
+        existing triggers are left untouched no matter the outcome; an
+        invalid replacement therefore aborts the batch while the old
+        table, its data and its triggers are all still in place.
+        """
+        if not replacement_sqls:
+            return
+        savepoint = "_alembic_trigger_validate"
+        connection.exec_driver_sql("SAVEPOINT %s" % savepoint)
+        try:
+            for trig_name, _ in replacement_sqls:
+                connection.exec_driver_sql(
+                    'DROP TRIGGER IF EXISTS "%s"'
+                    % trig_name.replace('"', '""')
+                )
+            for _, trig_sql in replacement_sqls:
+                connection.exec_driver_sql(trig_sql)
+        except Exception as err:
+            connection.exec_driver_sql("ROLLBACK TO %s" % savepoint)
+            connection.exec_driver_sql("RELEASE %s" % savepoint)
+            raise exc.CommandError(
+                "Replacement trigger definition failed to compile; "
+                "the batch alteration was aborted before the existing "
+                f"table was modified: {err}"
+            ) from err
+        else:
+            connection.exec_driver_sql("ROLLBACK TO %s" % savepoint)
+            connection.exec_driver_sql("RELEASE %s" % savepoint)
 
     def alter_column(self, *arg, **kw) -> None:
         self.batch.append(("alter_column", arg, kw))
@@ -467,7 +686,11 @@ class ApplyBatchImpl:
                     schema=referent_schema,
                 )
 
-    def _create(self, op_impl: DefaultImpl) -> None:
+    def _create(
+        self,
+        op_impl: DefaultImpl,
+        preserved_triggers: tuple[str, ...] | list[str] = (),
+    ) -> None:
         self._transfer_elements_to_new_table()
 
         op_impl.prep_table_for_batch(self, self.table)
@@ -505,6 +728,11 @@ class ApplyBatchImpl:
             try:
                 for idx in self._gather_indexes_from_both_tables():
                     op_impl.create_index(idx)
+                for trigger_sql in preserved_triggers:
+                    # exec_driver_sql so that the trigger body is passed
+                    # to the DBAPI verbatim; text() would misinterpret
+                    # colons inside string literals as bind parameters
+                    op_impl.connection.exec_driver_sql(trigger_sql)
             finally:
                 self.new_table.name = self.temp_table_name
 

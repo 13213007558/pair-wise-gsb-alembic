@@ -249,6 +249,7 @@ class AbstractOperations(util.ModuleClsProxy):
         reflect_args: tuple[Any, ...] = (),
         reflect_kwargs: Mapping[str, Any] = util.immutabledict(),
         naming_convention: dict[str, str] | None = None,
+        preserve_triggers: bool | Mapping[str, str | None] = False,
     ) -> Iterator[BatchOperations]:
         """Invoke a series of per-table migrations in batch.
 
@@ -379,6 +380,34 @@ class AbstractOperations(util.ModuleClsProxy):
          set is undefined.   Therefore it is best to specify the complete
          ordering of all columns for best results.
 
+        :param preserve_triggers: on SQLite, when the table is recreated
+         using "move and copy", controls whether the triggers of the table
+         are re-created on the new table.  The default, ``False``, is the
+         historical behavior: triggers are silently dropped along with the
+         old table.  Pass ``True`` to reflect the triggers of the table
+         and restore them, with their original definitions, once the data
+         copy has completed and the new table has been renamed into place;
+         the data copy itself therefore does not fire any trigger.  A
+         dictionary of the form ``{trigger_name: create_trigger_sql}``
+         may also be passed, in which case the given full ``CREATE
+         TRIGGER`` statement replaces the original definition of that
+         trigger; a value of ``None`` drops that trigger deliberately.
+
+         If a column that is dropped or renamed by the batch is referenced
+         anywhere in a trigger definition (including ``WHEN`` clauses,
+         ``OLD``/``NEW`` references, ``UPDATE OF`` columns and quoted
+         names), and no replacement definition is supplied for that
+         trigger, the batch is aborted with an error before the existing
+         table is modified; Alembic will not attempt to rewrite trigger
+         definitions itself.  The analysis is conservative and may also
+         require a replacement when a reference cannot be ruled out.
+
+         The option currently supports only ordinary tables in the main
+         database of a SQLite connection, and requires a live database
+         connection (it is not compatible with ``--sql`` offline mode).
+
+         .. versionadded:: 1.21
+
         .. note:: batch mode requires SQLAlchemy 0.8 or above.
 
         .. seealso::
@@ -398,6 +427,7 @@ class AbstractOperations(util.ModuleClsProxy):
             reflect_kwargs,
             naming_convention,
             partial_reordering,
+            preserve_triggers=preserve_triggers,
         )
         batch_op = BatchOperations(self.migration_context, impl=impl)
         yield batch_op

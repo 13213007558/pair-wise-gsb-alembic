@@ -35,6 +35,7 @@ from alembic import testing
 from alembic import util
 from alembic.ddl import sqlite
 from alembic.operations import Operations
+from alembic.operations.batch import _trigger_referenced_names
 from alembic.operations.batch import ApplyBatchImpl
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
@@ -2418,6 +2419,430 @@ class BatchRoundTripTest(_BatchRoundTripBase, TestBase):
 
         insp = inspect(connection)
         eq_(insp.get_indexes("foo"), [])
+
+
+class TriggerReferencedNamesTest(TestBase):
+    """Unit tests for the conservative identifier scan used to decide
+    whether a trigger may depend on a column."""
+
+    def test_old_new_and_when_references(self):
+        sql = (
+            "CREATE TRIGGER trg AFTER UPDATE OF x ON foo "
+            "WHEN OLD.x <> NEW.x BEGIN "
+            "INSERT INTO audit (old_x, new_x) VALUES (OLD.x, NEW.x); "
+            "END"
+        )
+        names = _trigger_referenced_names(sql)
+        assert "x" in names
+        assert "old_x" in names
+
+    def test_quoted_names(self):
+        sql = (
+            'CREATE TRIGGER "trg" AFTER UPDATE OF "my col" ON [foo] '
+            "BEGIN SELECT NEW.`my col`; END"
+        )
+        names = _trigger_referenced_names(sql)
+        assert "my col" in names
+        assert "foo" in names
+
+    def test_string_literals_and_comments_ignored(self):
+        sql = (
+            "CREATE TRIGGER trg AFTER INSERT ON foo BEGIN "
+            "INSERT INTO audit (action) VALUES ('dropped_col'); "
+            "-- dropped_col in a comment\n"
+            "/* dropped_col in a block comment */ "
+            "END"
+        )
+        names = _trigger_referenced_names(sql)
+        assert "dropped_col" not in names
+
+    def test_case_insensitive(self):
+        sql = "CREATE TRIGGER trg AFTER UPDATE OF X ON foo BEGIN SELECT 1; END"
+        assert "x" in _trigger_referenced_names(sql)
+
+
+class BatchPreserveTriggersTest(_BatchRoundTripBase, TestBase):
+    """Round-trip tests for the preserve_triggers option of
+    batch_alter_table() on SQLite."""
+
+    __only_on__ = "sqlite"
+
+    insert_trigger_sql = (
+        "CREATE TRIGGER trg_foo_insert AFTER INSERT ON foo "
+        "WHEN NEW.x > 0 "
+        "BEGIN "
+        "INSERT INTO foo_audit (action, row_id, old_x, new_x) "
+        "VALUES ('insert', NEW.id, NULL, NEW.x); "
+        "UPDATE foo_audit SET action = action || ':multi' "
+        "WHERE row_id = NEW.id; "
+        "END"
+    )
+
+    update_trigger_sql = (
+        'CREATE TRIGGER "trg_foo_update" AFTER UPDATE OF "x" ON foo '
+        'WHEN OLD."x" <> NEW."x" '
+        "BEGIN "
+        "INSERT INTO foo_audit (action, row_id, old_x, new_x) "
+        'VALUES (\'update\', OLD.id, OLD."x", NEW."x"); '
+        "END"
+    )
+
+    @testing.fixture(autouse=True)
+    def _trigger_table_fixture(self, metadata, connection):
+        foo = Table(
+            "foo",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50)),
+            Column("x", Integer),
+        )
+        audit = Table(
+            "foo_audit",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("action", String(50)),
+            Column("row_id", Integer),
+            Column("old_x", Integer),
+            Column("new_x", Integer),
+        )
+        with connection.begin():
+            foo.create(connection)
+            audit.create(connection)
+            connection.exec_driver_sql(self.insert_trigger_sql)
+            connection.exec_driver_sql(self.update_trigger_sql)
+            connection.execute(
+                foo.insert(),
+                [
+                    {"id": 1, "data": "d1", "x": 5},
+                    {"id": 2, "data": "d2", "x": 6},
+                    {"id": 3, "data": "d3", "x": 7},
+                ],
+            )
+            # the seed rows fired the insert trigger; clear the audit
+            # table so tests can assert on what the migration itself
+            # produced
+            connection.execute(audit.delete())
+        self.foo = foo
+        self.audit = audit
+
+    def _trigger_sqls(self, connection):
+        return {
+            name: sql
+            for name, sql in connection.exec_driver_sql(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'foo'"
+            )
+        }
+
+    def _assert_audit_rows(self, connection, expected):
+        eq_(
+            connection.execute(
+                select(
+                    self.audit.c.action,
+                    self.audit.c.row_id,
+                    self.audit.c.old_x,
+                    self.audit.c.new_x,
+                ).order_by(self.audit.c.id)
+            ).all(),
+            expected,
+        )
+
+    def _assert_foo_rows(self, connection, cols=("id", "data", "x")):
+        eq_(
+            connection.execute(
+                text("SELECT %s FROM foo ORDER BY id" % ", ".join(cols))
+            ).all(),
+            [(1, "d1", 5), (2, "d2", 6), (3, "d3", 7)]
+            if cols == ("id", "data", "x")
+            else None,
+        )
+
+    def test_preserve_triggers(self, connection):
+        with self.op.batch_alter_table(
+            "foo", recreate="always", preserve_triggers=True
+        ) as batch_op:
+            batch_op.alter_column("data", type_=String(100))
+
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+        # the data copy itself must not have fired any trigger
+        self._assert_audit_rows(connection, [])
+        self._assert_foo_rows(connection)
+
+        connection.execute(self.foo.insert().values(id=10, data="d10", x=10))
+        connection.execute(
+            self.foo.update().where(self.foo.c.id == 1).values(x=50)
+        )
+        self._assert_audit_rows(
+            connection,
+            [("insert:multi", 10, None, 10), ("update", 1, 5, 50)],
+        )
+
+    def test_default_behavior_drops_triggers(self, connection):
+        with self.op.batch_alter_table(
+            "foo", recreate="always"
+        ) as batch_op:
+            batch_op.alter_column("data", type_=String(100))
+
+        eq_(self._trigger_sqls(connection), {})
+
+    def test_drop_unrelated_column_preserves_triggers(self, connection):
+        with self.op.batch_alter_table(
+            "foo", recreate="always", preserve_triggers=True
+        ) as batch_op:
+            batch_op.drop_column("data")
+
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+        connection.execute(self.foo.insert().values(id=10, x=10))
+        self._assert_audit_rows(connection, [("insert:multi", 10, None, 10)])
+
+    def test_drop_and_readd_column_preserves_triggers(self, connection):
+        # the column exists in the new table under the same name, so the
+        # original trigger definitions remain valid
+        with self.op.batch_alter_table(
+            "foo", recreate="always", preserve_triggers=True
+        ) as batch_op:
+            batch_op.drop_column("x")
+            batch_op.add_column(Column("x", Integer))
+
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+
+    def test_drop_referenced_column_rejected(self, connection):
+        with expect_raises_message(
+            CommandError,
+            'Trigger "trg_foo_insert" on table "foo" may depend on '
+            "column",
+        ):
+            with self.op.batch_alter_table(
+                "foo", recreate="always", preserve_triggers=True
+            ) as batch_op:
+                batch_op.drop_column("x")
+
+        # nothing was modified; the old table, its data and its
+        # triggers are all still in place, without any rollback
+        self._assert_foo_rows(connection)
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+        connection.execute(self.foo.insert().values(id=10, data="d10", x=10))
+        self._assert_audit_rows(connection, [("insert:multi", 10, None, 10)])
+
+    def test_rename_referenced_column_rejected(self, connection):
+        with expect_raises_message(
+            CommandError,
+            'Trigger "trg_foo_insert" on table "foo" may depend on '
+            "column",
+        ):
+            with self.op.batch_alter_table(
+                "foo", recreate="always", preserve_triggers=True
+            ) as batch_op:
+                batch_op.alter_column("x", new_column_name="x2")
+
+        self._assert_foo_rows(connection)
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+
+    def test_rename_referenced_column_with_replacement(self, connection):
+        insert_replacement = (
+            "CREATE TRIGGER trg_foo_insert AFTER INSERT ON foo "
+            "WHEN NEW.x2 > 0 "
+            "BEGIN "
+            "INSERT INTO foo_audit (action, row_id, old_x, new_x) "
+            "VALUES ('insert', NEW.id, NULL, NEW.x2); "
+            "END"
+        )
+        update_replacement = (
+            "CREATE TRIGGER trg_foo_update AFTER UPDATE OF x2 ON foo "
+            "WHEN OLD.x2 <> NEW.x2 "
+            "BEGIN "
+            "INSERT INTO foo_audit (action, row_id, old_x, new_x) "
+            "VALUES ('update', OLD.id, OLD.x2, NEW.x2); "
+            "END"
+        )
+        with self.op.batch_alter_table(
+            "foo",
+            recreate="always",
+            preserve_triggers={
+                "trg_foo_insert": insert_replacement,
+                "trg_foo_update": update_replacement,
+            },
+        ) as batch_op:
+            batch_op.alter_column("x", new_column_name="x2")
+
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": insert_replacement,
+                "trg_foo_update": update_replacement,
+            },
+        )
+        self._assert_audit_rows(connection, [])
+
+        foo = Table("foo", MetaData(), autoload_with=connection)
+        connection.execute(foo.update().where(foo.c.id == 1).values(x2=50))
+        connection.execute(foo.insert().values(id=10, data="d10", x2=10))
+        self._assert_audit_rows(
+            connection, [("update", 1, 5, 50), ("insert", 10, None, 10)]
+        )
+
+    def test_invalid_replacement_aborts_before_table_is_touched(
+        self, connection
+    ):
+        with expect_raises_message(
+            CommandError, "Replacement trigger definition failed to compile"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers={
+                    "trg_foo_update": (
+                        "CREATE TRIGGER trg_foo_update AFTER UPDATE ON foo "
+                        "BEGIN INSERT INTO foo_audit VALUES ("
+                    )
+                },
+            ) as batch_op:
+                batch_op.alter_column("data", type_=String(100))
+
+        # the failure happened before the old table was dropped, so
+        # everything is still in place without any rollback
+        self._assert_foo_rows(connection)
+        eq_(
+            self._trigger_sqls(connection),
+            {
+                "trg_foo_insert": self.insert_trigger_sql,
+                "trg_foo_update": self.update_trigger_sql,
+            },
+        )
+        connection.execute(
+            self.foo.update().where(self.foo.c.id == 2).values(x=60)
+        )
+        self._assert_audit_rows(connection, [("update", 2, 6, 60)])
+
+    def test_replacement_name_must_match(self, connection):
+        with expect_raises_message(
+            CommandError, "creates a trigger named"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers={
+                    "trg_foo_update": (
+                        "CREATE TRIGGER some_other_name AFTER UPDATE ON foo "
+                        "BEGIN SELECT 1; END"
+                    )
+                },
+            ) as batch_op:
+                batch_op.alter_column("data", type_=String(100))
+
+    def test_replacement_must_be_create_trigger(self, connection):
+        with expect_raises_message(
+            CommandError, "must be a plain CREATE TRIGGER statement"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers={"trg_foo_update": "SELECT 1"},
+            ) as batch_op:
+                batch_op.alter_column("data", type_=String(100))
+
+    def test_unknown_trigger_in_mapping(self, connection):
+        with expect_raises_message(
+            CommandError, "which do not exist on table"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers={
+                    "trg_nonexistent": (
+                        "CREATE TRIGGER trg_nonexistent AFTER UPDATE ON foo "
+                        "BEGIN SELECT 1; END"
+                    )
+                },
+            ) as batch_op:
+                batch_op.alter_column("data", type_=String(100))
+
+    def test_drop_trigger_with_none(self, connection):
+        with self.op.batch_alter_table(
+            "foo",
+            recreate="always",
+            preserve_triggers={"trg_foo_update": None},
+        ) as batch_op:
+            batch_op.alter_column("data", type_=String(100))
+
+        eq_(
+            self._trigger_sqls(connection),
+            {"trg_foo_insert": self.insert_trigger_sql},
+        )
+
+    def test_preserve_triggers_with_schema_not_supported(self, connection):
+        with expect_raises_message(
+            CommandError, "only.*tables in the main database"
+        ):
+            with self.op.batch_alter_table(
+                "foo",
+                schema="main",
+                recreate="always",
+                preserve_triggers=True,
+            ) as batch_op:
+                batch_op.alter_column("data", type_=String(100))
+
+    def test_preserve_triggers_not_supported_other_dialects(self):
+        context = op_fixture()
+        op = Operations(context)
+        m = MetaData()
+        t = Table("foo", m, Column("id", Integer, primary_key=True))
+        with expect_raises_message(
+            CommandError, "only supported on SQLite"
+        ):
+            with op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers=True,
+                copy_from=t,
+            ):
+                pass
+
+    def test_preserve_triggers_not_supported_offline(self):
+        context = op_fixture(dialect="sqlite", as_sql=True)
+        op = Operations(context)
+        m = MetaData()
+        t = Table("foo", m, Column("id", Integer, primary_key=True))
+        with expect_raises_message(
+            CommandError, "cannot be used in --sql mode"
+        ):
+            with op.batch_alter_table(
+                "foo",
+                recreate="always",
+                preserve_triggers=True,
+                copy_from=t,
+            ):
+                pass
 
 
 class BatchRoundTripMySQLTest(BatchRoundTripTest):
