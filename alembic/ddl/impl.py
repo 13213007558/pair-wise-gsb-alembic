@@ -459,6 +459,39 @@ class DefaultImpl(metaclass=ImplMeta):
             table, self.connection, checkfirst=False, _ddl_runner=self
         )
 
+    def create_view(
+        self,
+        view_name: str | quoted_name,
+        definition: str,
+        *,
+        schema: str | quoted_name | None = None,
+    ) -> None:
+        preparer = self.dialect.identifier_preparer
+        if schema is not None:
+            name = "%s.%s" % (
+                preparer.quote(schema),
+                preparer.quote(view_name),
+            )
+        else:
+            name = preparer.quote(view_name)
+        self._exec("CREATE VIEW %s AS %s" % (name, definition))
+
+    def drop_view(
+        self,
+        view_name: str | quoted_name,
+        *,
+        schema: str | quoted_name | None = None,
+    ) -> None:
+        preparer = self.dialect.identifier_preparer
+        if schema is not None:
+            name = "%s.%s" % (
+                preparer.quote(schema),
+                preparer.quote(view_name),
+            )
+        else:
+            name = preparer.quote(view_name)
+        self._exec("DROP VIEW %s" % name)
+
     def create_index(self, index: Index, **kw: Any) -> None:
         self._exec(schema.CreateIndex(index, **kw))
 

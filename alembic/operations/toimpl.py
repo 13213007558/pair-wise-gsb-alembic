@@ -91,6 +91,30 @@ def drop_table(operations: "Operations", operation: "ops.DropTableOp") -> None:
     )
 
 
+@Operations.implementation_for(ops.CreateViewOp)
+def create_view(
+    operations: "Operations", operation: "ops.CreateViewOp"
+) -> None:
+    from ..views import ManagedViewError
+
+    try:
+        operations.impl.create_view(
+            operation.view_name,
+            operation.definition,
+            schema=operation.schema,
+        )
+    except Exception as exc:
+        raise ManagedViewError(
+            f"could not create view {operation.view_name!r} from the "
+            f"given definition {operation.definition!r}: {exc}"
+        ) from exc
+
+
+@Operations.implementation_for(ops.DropViewOp)
+def drop_view(operations: "Operations", operation: "ops.DropViewOp") -> None:
+    operations.impl.drop_view(operation.view_name, schema=operation.schema)
+
+
 @Operations.implementation_for(ops.DropColumnOp)
 def drop_column(
     operations: "Operations", operation: "ops.DropColumnOp"

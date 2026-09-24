@@ -304,6 +304,35 @@ def _drop_table(autogen_context: AutogenContext, op: ops.DropTableOp) -> str:
     return text
 
 
+@renderers.dispatch_for(ops.CreateViewOp)
+def _create_view(
+    autogen_context: AutogenContext, op: ops.CreateViewOp
+) -> str:
+    text = "%(prefix)screate_view(%(vname)r, %(definition)r" % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "vname": _ident(op.view_name),
+        "definition": op.definition,
+    }
+    if op.schema:
+        text += ", schema=%r" % _ident(op.schema)
+    if op.depends_on:
+        text += ", depends_on=%r" % (list(op.depends_on),)
+    text += ")"
+    return text
+
+
+@renderers.dispatch_for(ops.DropViewOp)
+def _drop_view(autogen_context: AutogenContext, op: ops.DropViewOp) -> str:
+    text = "%(prefix)sdrop_view(%(vname)r" % {
+        "prefix": _alembic_autogenerate_prefix(autogen_context),
+        "vname": _ident(op.view_name),
+    }
+    if op.schema:
+        text += ", schema=%r" % _ident(op.schema)
+    text += ")"
+    return text
+
+
 def _render_dialect_kwargs_items(
     autogen_context: AutogenContext, dialect_kwargs: _DialectArgView
 ) -> list[str]:

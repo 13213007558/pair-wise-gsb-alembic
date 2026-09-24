@@ -1427,6 +1427,135 @@ class DropTableOp(MigrateOperation):
         operations.invoke(op)
 
 
+@Operations.register_operation("create_view")
+class CreateViewOp(MigrateOperation):
+    """Represent a create view operation.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    def __init__(
+        self,
+        view_name: str | quoted_name,
+        definition: str,
+        *,
+        schema: str | quoted_name | None = None,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        self.view_name = view_name
+        self.definition = definition
+        self.schema = schema
+        self.depends_on = tuple(depends_on)
+
+    def reverse(self) -> DropViewOp:
+        return DropViewOp(
+            self.view_name,
+            schema=self.schema,
+            _reverse=self,
+        )
+
+    def to_diff_tuple(self) -> tuple[str, str | quoted_name, Any]:
+        return ("add_view", self.view_name, self.schema)
+
+    @classmethod
+    def create_view(
+        cls,
+        operations: Operations,
+        view_name: str | quoted_name,
+        definition: str,
+        *,
+        schema: str | quoted_name | None = None,
+        depends_on: Sequence[str] = (),
+    ) -> None:
+        r"""Issue a "create view" instruction using the current
+        migration context.
+
+        e.g.::
+
+            op.create_view(
+                "v1",
+                "SELECT id, name FROM t1",
+                depends_on=["t1"],
+            )
+
+        :param view_name: Name of the view to create.  To control
+         quoting of the name outside of the default behavior, use
+         the SQLAlchemy construct
+         :class:`~sqlalchemy.sql.elements.quoted_name`.
+        :param definition: the SQL query definition of the view, i.e.
+         the ``SELECT`` statement that follows ``CREATE VIEW <name> AS``.
+        :param schema: Optional schema name to operate within.
+        :param depends_on: optional sequence of dependency names, used
+         for ordering when several views are created or recreated in a
+         single migration.
+
+        """
+        op = cls(
+            view_name,
+            definition,
+            schema=schema,
+            depends_on=depends_on,
+        )
+        operations.invoke(op)
+
+
+@Operations.register_operation("drop_view")
+class DropViewOp(MigrateOperation):
+    """Represent a drop view operation.
+
+    .. versionadded:: 1.21.0
+
+    """
+
+    def __init__(
+        self,
+        view_name: str | quoted_name,
+        *,
+        schema: str | quoted_name | None = None,
+        _reverse: CreateViewOp | None = None,
+    ) -> None:
+        self.view_name = view_name
+        self.schema = schema
+        self._reverse = _reverse
+
+    def reverse(self) -> CreateViewOp:
+        if self._reverse is None:
+            raise NotImplementedError(
+                "cannot reverse a drop_view operation without the "
+                "original view definition"
+            )
+        return self._reverse
+
+    def to_diff_tuple(self) -> tuple[str, str | quoted_name, Any]:
+        return ("remove_view", self.view_name, self.schema)
+
+    @classmethod
+    def drop_view(
+        cls,
+        operations: Operations,
+        view_name: str | quoted_name,
+        *,
+        schema: str | quoted_name | None = None,
+    ) -> None:
+        r"""Issue a "drop view" instruction using the current
+        migration context.
+
+        e.g.::
+
+            op.drop_view("v1")
+
+        :param view_name: Name of the view to drop.  To control
+         quoting of the name outside of the default behavior, use
+         the SQLAlchemy construct
+         :class:`~sqlalchemy.sql.elements.quoted_name`.
+        :param schema: Optional schema name to operate within.
+
+        """
+        op = cls(view_name, schema=schema)
+        operations.invoke(op)
+
+
 class AlterTableOp(MigrateOperation):
     """Represent an alter table operation."""
 
