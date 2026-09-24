@@ -459,6 +459,18 @@ class DefaultImpl(metaclass=ImplMeta):
             table, self.connection, checkfirst=False, _ddl_runner=self
         )
 
+    def create_view(
+        self,
+        view_name: str,
+        definition: str,
+        *,
+        schema: str | None = None,
+    ) -> None:
+        self._exec(base.CreateView(view_name, definition, schema=schema))
+
+    def drop_view(self, view_name: str, *, schema: str | None = None) -> None:
+        self._exec(base.DropView(view_name, schema=schema))
+
     def create_index(self, index: Index, **kw: Any) -> None:
         self._exec(schema.CreateIndex(index, **kw))
 

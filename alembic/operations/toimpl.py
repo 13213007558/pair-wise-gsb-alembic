@@ -140,6 +140,22 @@ def create_table(
     return table
 
 
+@Operations.implementation_for(ops.CreateViewOp)
+def create_view(
+    operations: "Operations", operation: "ops.CreateViewOp"
+) -> None:
+    operations.impl.create_view(
+        operation.view_name, operation.definition, schema=operation.schema
+    )
+
+
+@Operations.implementation_for(ops.DropViewOp)
+def drop_view(
+    operations: "Operations", operation: "ops.DropViewOp"
+) -> None:
+    operations.impl.drop_view(operation.view_name, schema=operation.schema)
+
+
 @Operations.implementation_for(ops.RenameTableOp)
 def rename_table(
     operations: "Operations", operation: "ops.RenameTableOp"

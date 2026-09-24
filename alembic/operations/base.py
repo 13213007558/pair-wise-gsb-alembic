@@ -52,11 +52,13 @@ if TYPE_CHECKING:
     from .ops import CreateIndexOp
     from .ops import CreateTableCommentOp
     from .ops import CreateTableOp
+    from .ops import CreateViewOp
     from .ops import DropColumnOp
     from .ops import DropConstraintOp
     from .ops import DropIndexOp
     from .ops import DropTableCommentOp
     from .ops import DropTableOp
+    from .ops import DropViewOp
     from .ops import ExecuteSQLOp
     from .ops import MigrateOperation
     from ..ddl import DefaultImpl
@@ -430,6 +432,8 @@ class AbstractOperations(util.ModuleClsProxy):
             | DropColumnOp
             | BulkInsertOp
             | DropTableOp
+            | CreateViewOp
+            | DropViewOp
             | ExecuteSQLOp
         ),
     ) -> None: ...

@@ -277,6 +277,58 @@ CHECK constraints are explicitly named, ideally via a naming convention (see
 :doc:`naming`).   As always, the candidate migrations that autogenerate
 produces must be reviewed by hand.
 
+.. _autogenerate_managed_views:
+
+Managing Views
+^^^^^^^^^^^^^^
+
+Alembic can manage database views explicitly declared against the target
+metadata.  A view is declared with the :class:`alembic.views.View` class,
+which records the view's schema, name, defining query, and the objects it
+depends upon::
+
+    from alembic.views import View
+
+    View(
+        "v1",
+        "SELECT id, name FROM my_table",
+        depends_on=["my_table"],
+        metadata=Base.metadata,
+    )
+    View(
+        "v2",
+        "SELECT id FROM v1",
+        depends_on=["v1"],
+        metadata=Base.metadata,
+    )
+
+Views may also be registered after the fact using
+:func:`alembic.views.register_views`.  Declared views participate in
+autogenerate:  views present in the metadata but not in the database are
+created, and views whose definition no longer matches the database are
+dropped and recreated.  Views that exist in the database but are **not**
+declared are never touched.
+
+View operations are ordered by the declared dependencies, not by name:
+when a table or view changes, every managed view that depends on it is
+dropped *before* the table operations proceed, in reverse dependency
+order, and recreated afterwards in dependency order.  Declaring a
+dependency cycle, referencing an object that is neither declared nor
+present in the database, or providing a definition that is not valid
+against the current database raises an error at autogenerate time.
+
+View definitions are compared using a conservative normalization rule:
+a leading ``CREATE VIEW ... AS`` clause and trailing semicolons are
+removed, and whitespace runs *outside* of quoted string literals and
+quoted identifiers are collapsed.  The contents of string literals are
+never modified, so two definitions that differ inside a string literal
+are considered different.
+
+.. autoclass:: alembic.views.View
+    :members:
+
+.. autofunction:: alembic.views.register_views
+
 Notable 3rd-party libraries that extend the built-in Alembic autogenerate functionality
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

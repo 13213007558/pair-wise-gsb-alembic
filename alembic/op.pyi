@@ -37,11 +37,13 @@ if TYPE_CHECKING:
     from .operations.ops import CreateIndexOp
     from .operations.ops import CreateTableCommentOp
     from .operations.ops import CreateTableOp
+    from .operations.ops import CreateViewOp
     from .operations.ops import DropColumnOp
     from .operations.ops import DropConstraintOp
     from .operations.ops import DropIndexOp
     from .operations.ops import DropTableCommentOp
     from .operations.ops import DropTableOp
+    from .operations.ops import DropViewOp
     from .operations.ops import ExecuteSQLOp
     from .operations.ops import MigrateOperation
     from .runtime.migration import MigrationContext
@@ -967,6 +969,28 @@ def create_unique_constraint(
 
     """
 
+def create_view(
+    view_name: str,
+    definition: str,
+    *,
+    schema: str | None = None,
+) -> None:
+    r"""Issue a "create view" instruction using the current
+    migration context.
+
+    e.g.::
+
+        create_view("my_view", "SELECT id, name FROM my_table")
+
+    :param view_name: Name of the view
+    :param definition: The SQL query that defines the view, e.g. a
+     SELECT statement.
+    :param schema: Optional schema name to operate within.  To control
+     quoting of the schema outside of the default behavior, use
+     the SQLAlchemy construct
+     :class:`~sqlalchemy.sql.elements.quoted_name`.
+
+    """
 def drop_column(
     table_name: str, column_name: str, *, schema: str | None = None, **kw: Any
 ) -> None:
@@ -1122,6 +1146,25 @@ def drop_table_comment(
 
     """
 
+def drop_view(
+    view_name: str,
+    *,
+    schema: str | None = None,
+) -> None:
+    r"""Issue a "drop view" instruction using the current
+    migration context.
+
+    e.g.::
+
+        drop_view("my_view")
+
+    :param view_name: Name of the view
+    :param schema: Optional schema name to operate within.  To control
+     quoting of the schema outside of the default behavior, use
+     the SQLAlchemy construct
+     :class:`~sqlalchemy.sql.elements.quoted_name`.
+
+    """
 def execute(
     sqltext: Executable | str,
     *,
@@ -1348,6 +1391,8 @@ def invoke(
         | DropColumnOp
         | BulkInsertOp
         | DropTableOp
+        | CreateViewOp
+        | DropViewOp
         | ExecuteSQLOp
     ),
 ) -> None: ...

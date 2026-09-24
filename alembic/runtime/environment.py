@@ -56,6 +56,7 @@ NameFilterType = Literal[
     "unique_constraint",
     "foreign_key_constraint",
     "check_constraint",
+    "view",
 ]
 NameFilterParentNames = MutableMapping[
     Literal["schema_name", "table_name", "schema_qualified_table_name"],
@@ -641,7 +642,8 @@ class EnvironmentContext(util.ModuleClsProxy):
            database connection.
          * ``type``: a string describing the type of object; currently
            ``"schema"``, ``"table"``, ``"column"``, ``"index"``,
-           ``"unique_constraint"``, or ``"foreign_key_constraint"``
+           ``"unique_constraint"``, ``"foreign_key_constraint"``,
+           ``"check_constraint"``, or ``"view"``
          * ``parent_names``: a dictionary of "parent" object names, that are
            relative to the name being given.  Keys in this dictionary may
            include:  ``"schema_name"``, ``"table_name"`` or

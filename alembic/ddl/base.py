@@ -287,6 +287,47 @@ def visit_identity_column(
     )
 
 
+class CreateView(DDLElement):
+    """Represent a CREATE VIEW statement."""
+
+    def __init__(
+        self,
+        view_name: quoted_name | str,
+        definition: str,
+        schema: quoted_name | str | None = None,
+    ) -> None:
+        self.view_name = view_name
+        self.definition = definition
+        self.schema = schema
+
+
+class DropView(DDLElement):
+    """Represent a DROP VIEW statement."""
+
+    def __init__(
+        self,
+        view_name: quoted_name | str,
+        schema: quoted_name | str | None = None,
+    ) -> None:
+        self.view_name = view_name
+        self.schema = schema
+
+
+@compiles(CreateView)
+def visit_create_view(element: CreateView, compiler: DDLCompiler, **kw) -> str:
+    return "CREATE VIEW %s AS %s" % (
+        format_table_name(compiler, element.view_name, element.schema),
+        element.definition,
+    )
+
+
+@compiles(DropView)
+def visit_drop_view(element: DropView, compiler: DDLCompiler, **kw) -> str:
+    return "DROP VIEW %s" % format_table_name(
+        compiler, element.view_name, element.schema
+    )
+
+
 def quote_dotted(
     name: quoted_name | str, quote: functools.partial
 ) -> quoted_name | str:
