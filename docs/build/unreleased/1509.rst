@@ -1,0 +1,8 @@
+.. change::
+    :tags: feature
+
+    Added the database-free migration planning functions
+    create_migration_plan and check_migration_plan. Plans are serializable,
+    include each revision's expected head-set transition and inclusion
+    reason, and reject ambiguous or unreachable requests without loading
+    env.py or executing migrations.

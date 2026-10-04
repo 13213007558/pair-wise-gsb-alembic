@@ -15,6 +15,10 @@ from typing import cast
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from .plan import check_migration_plan
+from .plan import create_migration_plan
+from .plan import MigrationPlan
+from .plan import PlanRequest
 from . import revision
 from . import write_hooks
 from .. import util
@@ -285,6 +289,27 @@ class ScriptDirectory:
 
         with self._catch_revision_errors():
             return cast(Script, self.revision_map.get_revision(id_))
+
+    def create_migration_plan(
+        self,
+        requests: Sequence[PlanRequest | dict[str, Any]],
+    ) -> MigrationPlan:
+        """Build a serializable migration plan without running env.py."""
+
+        revision_map = revision.RevisionMap(self._load_revisions)
+        return create_migration_plan(revision_map, requests)
+
+    def check_migration_plan(
+        self,
+        plan: MigrationPlan | dict[str, Any],
+        current_heads_by_database: dict[
+            str, Sequence[str] | set[str] | tuple[str, ...]
+        ],
+    ) -> None:
+        """Check a serialized plan against this graph and database heads."""
+
+        revision_map = revision.RevisionMap(self._load_revisions)
+        check_migration_plan(revision_map, plan, current_heads_by_database)
 
     def as_revision_number(
         self, id_: str | None
