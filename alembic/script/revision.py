@@ -192,6 +192,7 @@ class RevisionMap:
         # Ordering required for some tests to pass (but not required in
         # general)
         map_: _InterimRevisionMapType = sqlautil.OrderedDict()
+        duplicate_revisions: list[str] = []
 
         heads: set[Revision] = sqlautil.OrderedSet()
         _real_heads: set[Revision] = sqlautil.OrderedSet()
@@ -205,6 +206,7 @@ class RevisionMap:
             all_revisions.add(revision)
 
             if revision.revision in map_:
+                duplicate_revisions.append(revision.revision)
                 util.warn(
                     "Revision %s is present more than once" % revision.revision
                 )
@@ -237,6 +239,7 @@ class RevisionMap:
                         "Revision %s referenced from %s is not present"
                         % (downrev, rev)
                     )
+                    continue
                 down_revision = map_[downrev]
                 down_revision.add_nextrev(rev)
                 if downrev in rev._versioned_down_revisions:
@@ -251,6 +254,7 @@ class RevisionMap:
 
         revision_map: _RevisionMapType = dict(map_.items())
         revision_map[None] = revision_map[()] = None
+        self._duplicate_revisions = tuple(duplicate_revisions)
         self.heads = tuple(rev.revision for rev in heads)
         self._real_heads = tuple(rev.revision for rev in _real_heads)
         self.bases = tuple(rev.revision for rev in bases)
@@ -1048,7 +1052,8 @@ class RevisionMap:
         children: Sequence[_RevisionOrBase | None]
         for _ in range(abs(steps)):
             if steps > 0:
-                assert initial != "base"
+                if isinstance(initial, str):
+                    raise RevisionError("Cannot walk up from base")
                 # Walk up
                 walk_up = [
                     is_revision(rev)
@@ -1062,7 +1067,7 @@ class RevisionMap:
                     children = walk_up
             else:
                 # Walk down
-                if initial == "base":
+                if isinstance(initial, str):
                     children = ()
                 else:
                     children = self.get_revisions(

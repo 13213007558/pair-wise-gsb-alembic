@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Mapping
 from collections.abc import Sequence
 from contextlib import contextmanager
 import datetime
@@ -17,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from . import revision
 from . import write_hooks
+from .. import plan as migration_plan
 from .. import util
 from ..runtime import migration
 from ..util import compat
@@ -24,6 +27,8 @@ from ..util import not_none
 from ..util.pyfiles import _preserving_path_as_str
 
 if TYPE_CHECKING:
+    from ..plan import DatabasePlanRequest
+    from ..plan import MigrationPlan
     from .revision import _GetRevArg
     from .revision import _RevIdType
     from .revision import Revision
@@ -285,6 +290,21 @@ class ScriptDirectory:
 
         with self._catch_revision_errors():
             return cast(Script, self.revision_map.get_revision(id_))
+
+    def build_migration_plan(
+        self,
+        databases: Iterable["DatabasePlanRequest | Mapping[str, Any]"],
+    ) -> "MigrationPlan":
+        """Build a serializable migration plan from this script graph."""
+
+        return migration_plan.build_migration_plan(
+            self.revision_map, databases
+        )
+
+    def revision_graph_identity(self) -> str:
+        """Return the stable identity of this revision graph."""
+
+        return migration_plan.revision_graph_identity(self.revision_map)
 
     def as_revision_number(
         self, id_: str | None
